@@ -1,6 +1,6 @@
 {
   "name": "@kdinisv/coflight",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Tiny TypeScript library for deduplicating concurrent async calls by key. One real request, many awaiters, zero duplicate work.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -19,7 +19,9 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "README.ru.md"
   ],
   "scripts": {
     "build": "tsup",
