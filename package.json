@@ -1,5 +1,5 @@
 {
-  "name": "coflight",
+  "name": "@kdinisv/coflight",
   "version": "0.1.0",
   "description": "Tiny TypeScript library for deduplicating concurrent async calls by key. One real request, many awaiters, zero duplicate work.",
   "type": "module",
