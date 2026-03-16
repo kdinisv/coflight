@@ -5,6 +5,13 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function liveStats(group: {
+  stats: () => { inflight: number; cached: number; stale: number };
+}): { inflight: number; cached: number; stale: number } {
+  const { inflight, cached, stale } = group.stats();
+  return { inflight, cached, stale };
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency stress
 // ---------------------------------------------------------------------------
@@ -126,7 +133,7 @@ describe("stress: sequential batches", () => {
 
     // Each batch coalesces into 1 call
     expect(totalCalls).toBe(100);
-    expect(group.stats()).toEqual({ inflight: 0, cached: 0 });
+    expect(liveStats(group)).toEqual({ inflight: 0, cached: 0, stale: 1 });
   });
 });
 

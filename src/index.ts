@@ -9,9 +9,32 @@ export interface CoflightOptions {
   staleIfError?: boolean;
 }
 
+export interface CoflightCreateOptions {
+  /** Maximum time to keep stale results in milliseconds. Omit to keep them until forgotten or replaced. Set to `0` to disable stale retention. */
+  staleTtl?: number;
+  /** Maximum number of stale results to keep. Omit to keep an unlimited number. Set to `0` to disable stale retention. */
+  maxStaleEntries?: number;
+}
+
+export interface CoflightWarmOptions {
+  /** Cache the warmed value for this many ms. Omit or set to `0` to skip TTL cache seeding. */
+  ttl?: number;
+  /** Also seed the stale store with the warmed value. Defaults to `true`. */
+  stale?: boolean;
+}
+
 export interface CoflightContext {
   /** AbortSignal that is aborted only when every subscriber has cancelled. Pass it into fetch, DB calls, etc. */
   signal: AbortSignal;
+}
+
+export type CoflightResultSource = "fresh" | "shared" | "cache" | "stale";
+
+export interface CoflightRunResult<V> {
+  /** Resolved value for this subscriber. */
+  value: V;
+  /** Where this subscriber received the value from. */
+  source: CoflightResultSource;
 }
 
 export interface CoflightStats {
@@ -19,6 +42,24 @@ export interface CoflightStats {
   inflight: number;
   /** Number of cached (TTL) results. */
   cached: number;
+  /** Number of retained stale results. */
+  stale: number;
+  /** Total subscriber calls made through `run` or `runDetailed`. */
+  requests: number;
+  /** Number of times a new underlying operation was started. */
+  freshRuns: number;
+  /** Number of subscribers that joined an existing in-flight operation. */
+  sharedRuns: number;
+  /** Number of results served directly from the TTL cache. */
+  cacheHits: number;
+  /** Number of subscribers that received a stale fallback after an error. */
+  staleHits: number;
+  /** Number of successful cache warm-ups. */
+  warmups: number;
+  /** Number of subscribers aborted by their own signal. */
+  aborts: number;
+  /** Number of subscribers rejected by timeout. */
+  timeouts: number;
 }
 
 export interface CoflightGroup<K extends string = string, V = unknown> {
@@ -33,6 +74,16 @@ export interface CoflightGroup<K extends string = string, V = unknown> {
     options?: CoflightOptions,
   ): Promise<V>;
 
+  /** Like `run`, but also reports whether the value came from fresh work, a shared flight, cache, or stale fallback. */
+  runDetailed(
+    key: K,
+    fn: (ctx: CoflightContext) => Promise<V> | V,
+    options?: CoflightOptions,
+  ): Promise<CoflightRunResult<V>>;
+
+  /** Seed cache and stale storage for a key before traffic arrives. Returns `false` if nothing was written. */
+  warm(key: K, value: V, options?: CoflightWarmOptions): boolean;
+
   /** Remove `key` from the flight map, TTL cache, and stale store. Existing subscribers still receive their result. */
   forget(key: K): boolean;
 
@@ -42,13 +93,9 @@ export interface CoflightGroup<K extends string = string, V = unknown> {
   /** Whether an operation for `key` is currently in-flight. */
   isRunning(key: K): boolean;
 
-  /** Snapshot of internal counters. */
+  /** Snapshot of live counts and cumulative runtime counters. */
   stats(): CoflightStats;
 }
-
-// ---------------------------------------------------------------------------
-// Internal types
-// ---------------------------------------------------------------------------
 
 interface Flight<V> {
   promise: Promise<V>;
@@ -63,9 +110,10 @@ interface CacheEntry<V> {
   timer: ReturnType<typeof setTimeout>;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+interface StaleEntry<V> {
+  value: V;
+  expiresAt: number | null;
+}
 
 function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
   if (typeof timer === "object" && typeof timer.unref === "function") {
@@ -73,36 +121,136 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
+function hasPositiveDuration(value: number | undefined): value is number {
+  return value != null && value > 0;
+}
 
-export function createCoflight<
-  K extends string = string,
-  V = unknown,
->(): CoflightGroup<K, V> {
+export function createCoflight<K extends string = string, V = unknown>(
+  options: CoflightCreateOptions = {},
+): CoflightGroup<K, V> {
   const flights = new Map<K, Flight<V>>();
   const cache = new Map<K, CacheEntry<V>>();
-  const staleStore = new Map<K, V>();
+  const staleStore = new Map<K, StaleEntry<V>>();
+  const counters = {
+    requests: 0,
+    freshRuns: 0,
+    sharedRuns: 0,
+    cacheHits: 0,
+    staleHits: 0,
+    warmups: 0,
+    aborts: 0,
+    timeouts: 0,
+  };
 
-  // -----------------------------------------------------------------------
-  // run
-  // -----------------------------------------------------------------------
+  function clearCacheEntry(key: K): boolean {
+    const entry = cache.get(key);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    cache.delete(key);
+    return true;
+  }
+
+  function storeCachedValue(
+    key: K,
+    value: V,
+    ttl: number | undefined,
+  ): boolean {
+    clearCacheEntry(key);
+    if (!hasPositiveDuration(ttl)) return false;
+
+    const timer = setTimeout(() => {
+      if (cache.get(key)?.timer === timer) cache.delete(key);
+    }, ttl);
+    unrefTimer(timer);
+    cache.set(key, { value, timer });
+    return true;
+  }
+
+  function pruneStaleLimit(): void {
+    const maxStaleEntries = options.maxStaleEntries;
+    if (maxStaleEntries == null) return;
+
+    if (maxStaleEntries <= 0) {
+      staleStore.clear();
+      return;
+    }
+
+    while (staleStore.size > maxStaleEntries) {
+      const oldestKey = staleStore.keys().next().value as K | undefined;
+      if (oldestKey === undefined) return;
+      staleStore.delete(oldestKey);
+    }
+  }
+
+  function sweepExpiredStale(): void {
+    if (staleStore.size === 0) return;
+
+    const now = Date.now();
+    for (const [key, entry] of staleStore) {
+      if (entry.expiresAt != null && entry.expiresAt <= now) {
+        staleStore.delete(key);
+      }
+    }
+  }
+
+  function getStaleValue(key: K): V | undefined {
+    const entry = staleStore.get(key);
+    if (!entry) return undefined;
+
+    if (entry.expiresAt != null && entry.expiresAt <= Date.now()) {
+      staleStore.delete(key);
+      return undefined;
+    }
+
+    return entry.value;
+  }
+
+  function storeStaleValue(key: K, value: V): boolean {
+    const staleTtl = options.staleTtl;
+    const maxStaleEntries = options.maxStaleEntries;
+
+    if (
+      (staleTtl != null && staleTtl <= 0) ||
+      (maxStaleEntries != null && maxStaleEntries <= 0)
+    ) {
+      staleStore.delete(key);
+      return false;
+    }
+
+    const expiresAt = staleTtl == null ? null : Date.now() + staleTtl;
+    staleStore.delete(key);
+    staleStore.set(key, { value, expiresAt });
+    pruneStaleLimit();
+    return true;
+  }
+
   function run(
     key: K,
     fn: (ctx: CoflightContext) => Promise<V> | V,
     options?: CoflightOptions,
   ): Promise<V> {
-    // 1. Serve from TTL cache
+    return runDetailed(key, fn, options).then((result) => result.value);
+  }
+
+  function runDetailed(
+    key: K,
+    fn: (ctx: CoflightContext) => Promise<V> | V,
+    options?: CoflightOptions,
+  ): Promise<CoflightRunResult<V>> {
+    counters.requests++;
+
     const cached = cache.get(key);
-    if (cached) return Promise.resolve(cached.value);
+    if (cached) {
+      counters.cacheHits++;
+      return Promise.resolve({ value: cached.value, source: "cache" });
+    }
 
-    // 2. Join existing flight or start a new one
+    let source: CoflightResultSource = "fresh";
     let flight = flights.get(key);
-    if (!flight) {
-      const controller = new AbortController();
 
-      // Wrap fn so that synchronous throws become rejections
+    if (!flight) {
+      counters.freshRuns++;
+      const controller = new AbortController();
       const promise = new Promise<V>((resolve, reject) => {
         try {
           resolve(fn({ signal: controller.signal }));
@@ -121,37 +269,30 @@ export function createCoflight<
 
       flights.set(key, flight);
 
-      // Flight completion bookkeeping (runs once, regardless of subscriber count)
-      const f = flight;
+      const currentFlight = flight;
       promise.then(
         (value) => {
-          f.settled = true;
-          staleStore.set(key, value);
-          // Only touch the map / cache if *this* flight is still the current one
-          // (forget + re-run could have replaced it).
-          if (flights.get(key) === f) {
+          currentFlight.settled = true;
+          storeStaleValue(key, value);
+          if (flights.get(key) === currentFlight) {
             flights.delete(key);
-            if (f.ttl != null && f.ttl > 0) {
-              const timer = setTimeout(() => {
-                if (cache.get(key)?.timer === timer) cache.delete(key);
-              }, f.ttl);
-              unrefTimer(timer);
-              cache.set(key, { value, timer });
-            }
+            storeCachedValue(key, value, currentFlight.ttl);
           }
         },
         () => {
-          f.settled = true;
-          if (flights.get(key) === f) flights.delete(key);
+          currentFlight.settled = true;
+          if (flights.get(key) === currentFlight) flights.delete(key);
         },
       );
+    } else {
+      source = "shared";
+      counters.sharedRuns++;
     }
 
-    // 3. Register a new subscriber
     flight.subscribers++;
-    const f = flight;
+    const currentFlight = flight;
 
-    return new Promise<V>((resolve, reject) => {
+    return new Promise<CoflightRunResult<V>>((resolve, reject) => {
       let subscriberSettled = false;
       let tid: ReturnType<typeof setTimeout> | undefined;
 
@@ -172,46 +313,45 @@ export function createCoflight<
         action();
       };
 
-      /** Decrement subscriber count; abort shared controller when nobody is left. */
       const leave = () => {
-        f.subscribers--;
-        if (f.subscribers <= 0 && !f.settled) {
-          f.controller.abort();
+        currentFlight.subscribers--;
+        if (currentFlight.subscribers <= 0 && !currentFlight.settled) {
+          currentFlight.controller.abort();
         }
       };
 
       const onAbort = (): void =>
         settle(() => {
           leave();
+          counters.aborts++;
           reject(
             options?.signal?.reason ??
               new DOMException("The operation was aborted.", "AbortError"),
           );
         });
 
-      // Fast-path: signal already aborted before we subscribed
       if (options?.signal?.aborted) {
         settle(() => {
           leave();
+          counters.aborts++;
           reject(
-            options!.signal!.reason ??
+            options?.signal?.reason ??
               new DOMException("The operation was aborted.", "AbortError"),
           );
         });
         return;
       }
 
-      // Per-subscriber abort listener (once: true to avoid leaks)
       if (options?.signal) {
         options.signal.addEventListener("abort", onAbort, { once: true });
       }
 
-      // Per-subscriber timeout
-      if (options?.timeout != null && options.timeout > 0) {
+      if (hasPositiveDuration(options?.timeout)) {
         tid = setTimeout(
           () =>
             settle(() => {
               leave();
+              counters.timeouts++;
               reject(
                 new DOMException("The operation timed out.", "TimeoutError"),
               );
@@ -220,14 +360,17 @@ export function createCoflight<
         );
       }
 
-      // Wait for the shared flight to complete
-      f.promise.then(
-        (value) => settle(() => resolve(value)),
+      currentFlight.promise.then(
+        (value) => settle(() => resolve({ value, source })),
         (error) =>
           settle(() => {
-            if (options?.staleIfError && staleStore.has(key)) {
-              resolve(staleStore.get(key) as V);
-              return;
+            if (options?.staleIfError) {
+              const staleValue = getStaleValue(key);
+              if (staleValue !== undefined) {
+                counters.staleHits++;
+                resolve({ value: staleValue, source: "stale" });
+                return;
+              }
             }
             reject(error);
           }),
@@ -235,19 +378,24 @@ export function createCoflight<
     });
   }
 
-  // -----------------------------------------------------------------------
-  // forget / clear / isRunning / stats
-  // -----------------------------------------------------------------------
+  function warm(key: K, value: V, options?: CoflightWarmOptions): boolean {
+    if (flights.has(key)) return false;
+
+    const cached = storeCachedValue(key, value, options?.ttl);
+    const stale =
+      options?.stale === false ? false : storeStaleValue(key, value);
+
+    if (!cached && !stale) return false;
+
+    counters.warmups++;
+    return true;
+  }
 
   function forget(key: K): boolean {
     const hadFlight = flights.delete(key);
-    const entry = cache.get(key);
-    if (entry) {
-      clearTimeout(entry.timer);
-      cache.delete(key);
-    }
+    const hadCache = clearCacheEntry(key);
     const hadStale = staleStore.delete(key);
-    return hadFlight || !!entry || hadStale;
+    return hadFlight || hadCache || hadStale;
   }
 
   function clear(): void {
@@ -262,8 +410,22 @@ export function createCoflight<
   }
 
   function stats(): CoflightStats {
-    return { inflight: flights.size, cached: cache.size };
+    sweepExpiredStale();
+
+    return {
+      inflight: flights.size,
+      cached: cache.size,
+      stale: staleStore.size,
+      requests: counters.requests,
+      freshRuns: counters.freshRuns,
+      sharedRuns: counters.sharedRuns,
+      cacheHits: counters.cacheHits,
+      staleHits: counters.staleHits,
+      warmups: counters.warmups,
+      aborts: counters.aborts,
+      timeouts: counters.timeouts,
+    };
   }
 
-  return { run, forget, clear, isRunning, stats };
+  return { run, runDetailed, warm, forget, clear, isRunning, stats };
 }

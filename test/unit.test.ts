@@ -9,6 +9,13 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function liveStats(group: {
+  stats: () => { inflight: number; cached: number; stale: number };
+}): { inflight: number; cached: number; stale: number } {
+  const { inflight, cached, stale } = group.stats();
+  return { inflight, cached, stale };
+}
+
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -139,7 +146,7 @@ describe("clear", () => {
 
     expect(group.stats().inflight).toBe(2);
     group.clear();
-    expect(group.stats()).toEqual({ inflight: 0, cached: 0 });
+    expect(liveStats(group)).toEqual({ inflight: 0, cached: 0, stale: 0 });
 
     // Let existing promises settle
     await Promise.all([p1, p2]);
@@ -169,13 +176,218 @@ describe("isRunning", () => {
 describe("stats", () => {
   it("reports inflight and cached counts", async () => {
     const group = createCoflight<string, number>();
-    expect(group.stats()).toEqual({ inflight: 0, cached: 0 });
+    expect(group.stats()).toMatchObject({
+      inflight: 0,
+      cached: 0,
+      stale: 0,
+      requests: 0,
+      freshRuns: 0,
+      sharedRuns: 0,
+      cacheHits: 0,
+      staleHits: 0,
+      warmups: 0,
+      aborts: 0,
+      timeouts: 0,
+    });
 
     const p = group.run("key", () => delay(30).then(() => 1), { ttl: 5000 });
     expect(group.stats().inflight).toBe(1);
 
     await p;
-    expect(group.stats()).toEqual({ inflight: 0, cached: 1 });
+    expect(group.stats()).toMatchObject({
+      inflight: 0,
+      cached: 1,
+      stale: 1,
+      requests: 1,
+      freshRuns: 1,
+      sharedRuns: 0,
+      cacheHits: 0,
+      staleHits: 0,
+      warmups: 0,
+      aborts: 0,
+      timeouts: 0,
+    });
+  });
+
+  it("tracks shared, cache, stale, abort and timeout counters", async () => {
+    const group = createCoflight<string, number>();
+
+    const first = group.runDetailed(
+      "key",
+      async () => {
+        await delay(40);
+        return 7;
+      },
+      { ttl: 20 },
+    );
+    const second = group.runDetailed("key", async () => 8);
+
+    await expect(first).resolves.toMatchObject({ value: 7, source: "fresh" });
+    await expect(second).resolves.toMatchObject({ value: 7, source: "shared" });
+
+    await expect(
+      group.runDetailed("key", async () => 9),
+    ).resolves.toMatchObject({
+      value: 7,
+      source: "cache",
+    });
+
+    await delay(30);
+
+    await expect(
+      group.runDetailed(
+        "key",
+        async () => {
+          throw new Error("boom");
+        },
+        { staleIfError: true },
+      ),
+    ).resolves.toMatchObject({ value: 7, source: "stale" });
+
+    const abortController = new AbortController();
+    const aborted = group.run("abort", () => delay(100).then(() => 1), {
+      signal: abortController.signal,
+    });
+    abortController.abort();
+    await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
+
+    await expect(
+      group.run("timeout", () => delay(100).then(() => 1), { timeout: 10 }),
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+
+    expect(group.stats()).toMatchObject({
+      requests: 6,
+      freshRuns: 4,
+      sharedRuns: 1,
+      cacheHits: 1,
+      staleHits: 1,
+      aborts: 1,
+      timeouts: 1,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 1: visibility and control
+// ---------------------------------------------------------------------------
+
+describe("runDetailed", () => {
+  it("reports whether the result was fresh, shared, cached, or stale", async () => {
+    const group = createCoflight<string, number>();
+
+    const fresh = group.runDetailed(
+      "key",
+      async () => {
+        await delay(20);
+        return 42;
+      },
+      { ttl: 20 },
+    );
+
+    const shared = group.runDetailed("key", async () => 0);
+
+    await expect(fresh).resolves.toEqual({ value: 42, source: "fresh" });
+    await expect(shared).resolves.toEqual({ value: 42, source: "shared" });
+
+    await expect(group.runDetailed("key", async () => 1)).resolves.toEqual({
+      value: 42,
+      source: "cache",
+    });
+
+    await delay(30);
+
+    await expect(
+      group.runDetailed(
+        "key",
+        async () => {
+          throw new Error("fail");
+        },
+        { staleIfError: true },
+      ),
+    ).resolves.toEqual({ value: 42, source: "stale" });
+  });
+});
+
+describe("warm", () => {
+  it("warms cache and stale storage before traffic arrives", async () => {
+    const group = createCoflight<string, number>();
+
+    expect(group.warm("key", 55, { ttl: 500 })).toBe(true);
+
+    await expect(group.runDetailed("key", async () => 99)).resolves.toEqual({
+      value: 55,
+      source: "cache",
+    });
+
+    expect(group.stats()).toMatchObject({
+      cached: 1,
+      stale: 1,
+      warmups: 1,
+      cacheHits: 1,
+    });
+  });
+
+  it("does not override an active flight", async () => {
+    const group = createCoflight<string, number>();
+    const pending = group.run("key", () => delay(30).then(() => 1));
+
+    expect(group.warm("key", 99, { ttl: 1000 })).toBe(false);
+
+    await expect(pending).resolves.toBe(1);
+  });
+});
+
+describe("stale limits", () => {
+  it("expires stale entries after staleTtl", async () => {
+    vi.useFakeTimers();
+    const group = createCoflight<string, number>({ staleTtl: 100 });
+
+    await group.run("key", async () => 1);
+    expect(group.stats().stale).toBe(1);
+
+    vi.advanceTimersByTime(150);
+
+    await expect(
+      group.run(
+        "key",
+        async () => {
+          throw new Error("boom");
+        },
+        { staleIfError: true },
+      ),
+    ).rejects.toThrow("boom");
+
+    expect(group.stats().stale).toBe(0);
+  });
+
+  it("caps stale storage by maxStaleEntries", async () => {
+    const group = createCoflight<string, number>({ maxStaleEntries: 2 });
+
+    await group.run("a", async () => 1);
+    await group.run("b", async () => 2);
+    await group.run("c", async () => 3);
+
+    expect(group.stats().stale).toBe(2);
+
+    await expect(
+      group.run(
+        "a",
+        async () => {
+          throw new Error("a-missed");
+        },
+        { staleIfError: true },
+      ),
+    ).rejects.toThrow("a-missed");
+
+    await expect(
+      group.run(
+        "c",
+        async () => {
+          throw new Error("c-missed");
+        },
+        { staleIfError: true },
+      ),
+    ).resolves.toBe(3);
   });
 });
 

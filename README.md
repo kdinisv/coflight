@@ -43,10 +43,10 @@ Status legend: `[ ]` planned, `[x]` done. The version column shows the release w
 
 | Status | Version | What will be added        | Why it matters                                                   |
 | ------ | ------- | ------------------------- | ---------------------------------------------------------------- |
-| [ ]    | TBD     | Better runtime stats      | Makes shared work and cache usage easier to understand.          |
-| [ ]    | TBD     | Clearer result source     | Shows whether a result came from a shared request or from cache. |
-| [ ]    | TBD     | Cache warm-up support     | Lets hot paths be prepared before real traffic arrives.          |
-| [ ]    | TBD     | Safer stale-result limits | Keeps stale data useful without letting it grow out of control.  |
+| [x]    | 0.2.0   | Better runtime stats      | Makes shared work and cache usage easier to understand.          |
+| [x]    | 0.2.0   | Clearer result source     | Shows whether a result came from a shared request or from cache. |
+| [x]    | 0.2.0   | Cache warm-up support     | Lets hot paths be prepared before real traffic arrives.          |
+| [x]    | 0.2.0   | Safer stale-result limits | Keeps stale data useful without letting it grow out of control.  |
 
 ### Phase 2: Smarter Freshness
 
@@ -92,16 +92,26 @@ async function getUser(id: string, signal?: AbortSignal): Promise<User> {
     { signal, timeout: 3000, ttl: 5000 },
   );
 }
+
+users.warm("user:42", { id: "42", name: "Warm cache" }, { ttl: 2_000 });
+
+const detailed = await users.runDetailed("user:42", ({ signal }) =>
+  fetch(`/api/users/42`, { signal }).then((r) => r.json()),
+);
+
+console.log(detailed.source); // "cache"
 ```
 
 ## API
 
-### `createCoflight<K, V>()`
+### `createCoflight<K, V>(options?)`
 
 Creates a new coalescing group.
 
 - `K` — key type (extends `string`, default `string`)
 - `V` — value type (default `unknown`)
+- `options?.staleTtl` — max age for stale results in ms. Omit to keep stale results until replaced or forgotten. Set to `0` to disable stale retention.
+- `options?.maxStaleEntries` — upper bound for retained stale results. Omit for no limit. Set to `0` to disable stale retention.
 
 Returns a `CoflightGroup<K, V>`.
 
@@ -128,6 +138,31 @@ Returns `Promise<V>`.
 
 ---
 
+### `group.runDetailed(key, fn, options?)`
+
+Same execution model as `group.run`, but returns both the value and its source.
+
+Returns `Promise<{ value: V; source: "fresh" | "shared" | "cache" | "stale" }>`.
+
+- `fresh` — this subscriber started the real work.
+- `shared` — this subscriber joined an already running flight.
+- `cache` — the result came from the TTL cache.
+- `stale` — the real operation failed and `staleIfError` returned the last successful value.
+
+---
+
+### `group.warm(key, value, options?)`
+
+Seed a key before traffic arrives.
+
+- `value: V` — value to place into warm storage.
+- `options?.ttl` — optional TTL cache window in ms.
+- `options?.stale` — whether to also seed the stale store. Defaults to `true`.
+
+Returns `boolean` — `true` if cache or stale storage was written. Returns `false` when the key is already in-flight or when nothing could be stored.
+
+---
+
 ### `group.forget(key)`
 
 Remove `key` from the flight map, TTL cache, and stale result store. Existing subscribers continue to receive their result.
@@ -150,7 +185,23 @@ Returns `boolean` — whether there is an in-flight operation for the key.
 
 ### `group.stats()`
 
-Returns `{ inflight: number; cached: number }`.
+Returns live counts plus cumulative runtime counters:
+
+```ts
+{
+  inflight: number;
+  cached: number;
+  stale: number;
+  requests: number;
+  freshRuns: number;
+  sharedRuns: number;
+  cacheHits: number;
+  staleHits: number;
+  warmups: number;
+  aborts: number;
+  timeouts: number;
+}
+```
 
 ## How It Works
 
@@ -298,10 +349,10 @@ MIT
 
 | Статус | Версия | Что будет                      | Зачем это нужно                                                          |
 | ------ | ------ | ------------------------------ | ------------------------------------------------------------------------ |
-| [ ]    | TBD    | Более понятная статистика      | Показывает, как часто работа реально разделяется и как используется кеш. |
-| [ ]    | TBD    | Понятный источник результата   | Показывает, пришёл ли результат из общего запроса или из кеша.           |
-| [ ]    | TBD    | Поддержка прогрева кеша        | Позволяет заранее подготовить горячие пути до прихода нагрузки.          |
-| [ ]    | TBD    | Безопасные лимиты stale-данных | Помогает держать устаревшие данные под контролем.                        |
+| [x]    | 0.2.0  | Более понятная статистика      | Показывает, как часто работа реально разделяется и как используется кеш. |
+| [x]    | 0.2.0  | Понятный источник результата   | Показывает, пришёл ли результат из общего запроса или из кеша.           |
+| [x]    | 0.2.0  | Поддержка прогрева кеша        | Позволяет заранее подготовить горячие пути до прихода нагрузки.          |
+| [x]    | 0.2.0  | Безопасные лимиты stale-данных | Помогает держать устаревшие данные под контролем.                        |
 
 ### Фаза 2: Более умная свежесть
 
@@ -347,16 +398,26 @@ async function getUser(id: string, signal?: AbortSignal): Promise<User> {
     { signal, timeout: 3000, ttl: 5000 },
   );
 }
+
+users.warm("user:42", { id: "42", name: "Прогретый кеш" }, { ttl: 2_000 });
+
+const detailed = await users.runDetailed("user:42", ({ signal }) =>
+  fetch(`/api/users/42`, { signal }).then((r) => r.json()),
+);
+
+console.log(detailed.source); // "cache"
 ```
 
 ## API
 
-### `createCoflight<K, V>()`
+### `createCoflight<K, V>(options?)`
 
 Создаёт новую группу для дедупликации.
 
 - `K` — тип ключа (extends `string`, по умолчанию `string`)
 - `V` — тип значения (по умолчанию `unknown`)
+- `options?.staleTtl` — максимальный возраст stale-результатов в мс. Если не указывать, stale-значения живут до замены или forget. Значение `0` отключает stale-хранилище.
+- `options?.maxStaleEntries` — верхняя граница для количества stale-результатов. Если не указывать, лимита нет. Значение `0` отключает stale-хранилище.
 
 Возвращает `CoflightGroup<K, V>`.
 
@@ -383,6 +444,31 @@ async function getUser(id: string, signal?: AbortSignal): Promise<User> {
 
 ---
 
+### `group.runDetailed(key, fn, options?)`
+
+Работает как `group.run`, но дополнительно возвращает источник результата.
+
+Возвращает `Promise<{ value: V; source: "fresh" | "shared" | "cache" | "stale" }>`.
+
+- `fresh` — этот подписчик запустил реальную работу.
+- `shared` — этот подписчик присоединился к уже идущему полёту.
+- `cache` — результат был взят из TTL-кеша.
+- `stale` — реальная операция завершилась ошибкой, и `staleIfError` вернул последнее успешное значение.
+
+---
+
+### `group.warm(key, value, options?)`
+
+Заранее заполняет ключ значением до прихода реального трафика.
+
+- `value: V` — значение для прогрева.
+- `options?.ttl` — окно TTL-кеша в мс.
+- `options?.stale` — нужно ли одновременно прогреть stale-хранилище. По умолчанию `true`.
+
+Возвращает `boolean` — `true`, если удалось записать кеш или stale-значение. Возвращает `false`, если ключ уже выполняется или сохранить было нечего.
+
+---
+
 ### `group.forget(key)`
 
 Удаляет `key` из карты полётов, TTL-кеша и хранилища stale-результатов. Уже подписанные вызывающие продолжают получать свой результат.
@@ -405,7 +491,23 @@ async function getUser(id: string, signal?: AbortSignal): Promise<User> {
 
 ### `group.stats()`
 
-Возвращает `{ inflight: number; cached: number }`.
+Возвращает живые размеры внутренних хранилищ и накопительные счётчики:
+
+```ts
+{
+  inflight: number;
+  cached: number;
+  stale: number;
+  requests: number;
+  freshRuns: number;
+  sharedRuns: number;
+  cacheHits: number;
+  staleHits: number;
+  warmups: number;
+  aborts: number;
+  timeouts: number;
+}
+```
 
 ## Как это работает
 
