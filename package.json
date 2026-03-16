@@ -3,12 +3,20 @@
   "version": "0.2.0",
   "description": "Tiny TypeScript library for deduplicating concurrent async calls by key. One real request, many awaiters, zero duplicate work.",
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "homepage": "https://github.com/kdinisv/coflight#readme",
+  "bugs": {
+    "url": "https://github.com/kdinisv/coflight/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/kdinisv/coflight.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "exports": {
     ".": {
