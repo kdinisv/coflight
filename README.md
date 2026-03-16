@@ -50,21 +50,23 @@ Status legend: `[ ]` planned, `[x]` done. The version column shows the release w
 
 ### Phase 2: Smarter Freshness
 
-| Status | Version | What will be added                | Why it matters                                                    |
-| ------ | ------- | --------------------------------- | ----------------------------------------------------------------- |
-| [ ]    | TBD     | Background refresh for stale data | Keeps responses fast while data updates happen in the background. |
-| [ ]    | TBD     | Safer shutdown behavior           | Makes service shutdown with active requests more predictable.     |
-| [ ]    | TBD     | Easier monitoring integration     | Makes logs and metrics simpler to connect in real services.       |
-| [ ]    | TBD     | More practical examples           | Reduces integration mistakes in real applications.                |
+| Status | Version | What will be added                | Why it matters                                                             |
+| ------ | ------- | --------------------------------- | -------------------------------------------------------------------------- |
+| [ ]    | 0.3.0   | Background refresh for stale data | Keeps responses fast while stale values refresh quietly in the background. |
+| [ ]    | 0.3.0   | Safer key composition helpers     | Reduces cross-tenant and auth-scope mistakes when keys need more context.  |
+| [ ]    | 0.3.0   | More practical examples           | Shows how to structure keys and freshness rules in real services.          |
+| [ ]    | TBD     | Safer shutdown behavior           | Makes service shutdown with active requests more predictable.              |
 
 ### Phase 3: Production Maturity
 
-| Status | Version | What will be added           | Why it matters                                             |
-| ------ | ------- | ---------------------------- | ---------------------------------------------------------- |
-| [ ]    | TBD     | Performance benchmarks       | Sets realistic expectations about speed and tradeoffs.     |
-| [ ]    | TBD     | Integration examples         | Shows how the library fits into common application stacks. |
-| [ ]    | TBD     | Migration guides             | Makes it easier to move off older inflight-style packages. |
-| [ ]    | TBD     | Helper APIs for common cases | Adds convenience for recurring usage patterns.             |
+| Status | Version | What will be added                    | Why it matters                                                                     |
+| ------ | ------- | ------------------------------------- | ---------------------------------------------------------------------------------- |
+| [ ]    | 0.4.0   | Metrics-friendly observability hooks  | Makes it easier to forward shared, cache, and stale signals into logs and metrics. |
+| [ ]    | 0.4.0   | Optional group-level concurrency caps | Protects fragile backends without turning coflight into a full scheduler.          |
+| [ ]    | TBD     | Performance benchmarks                | Sets realistic expectations about speed and tradeoffs.                             |
+| [ ]    | TBD     | Migration guides                      | Makes it easier to move off older inflight-style packages.                         |
+
+Retry and backoff are intentionally not on the core roadmap for now. They are useful for real services, but their policies depend too much on transport, idempotency, and error classification to hard-code them into a small coalescing library.
 
 ## Install
 
@@ -356,21 +358,23 @@ MIT
 
 ### Фаза 2: Более умная свежесть
 
-| Статус | Версия | Что будет                             | Зачем это нужно                                                     |
-| ------ | ------ | ------------------------------------- | ------------------------------------------------------------------- |
-| [ ]    | TBD    | Фоновое обновление stale-данных       | Позволяет быстро отвечать пользователю и обновлять данные в фоне.   |
-| [ ]    | TBD    | Более безопасное завершение сервиса   | Делает остановку сервиса с активными запросами более предсказуемой. |
-| [ ]    | TBD    | Более простое подключение мониторинга | Упрощает подключение логирования, метрик и внешнего мониторинга.    |
-| [ ]    | TBD    | Больше практических примеров          | Снижает вероятность ошибок при интеграции.                          |
+| Статус | Версия | Что будет                            | Зачем это нужно                                                                  |
+| ------ | ------ | ------------------------------------ | -------------------------------------------------------------------------------- |
+| [ ]    | 0.3.0  | Фоновое обновление stale-данных      | Позволяет быстро отвечать и тихо обновлять устаревшие данные в фоне.             |
+| [ ]    | 0.3.0  | Более безопасные helper'ы для ключей | Снижают риск ошибок между tenant-ами, токенами и другими auth-scoped сценариями. |
+| [ ]    | 0.3.0  | Больше практических примеров         | Показывают, как собирать ключи и настраивать freshness в реальных сервисах.      |
+| [ ]    | TBD    | Более безопасное завершение сервиса  | Делает остановку сервиса с активными запросами более предсказуемой.              |
 
 ### Фаза 3: Production-зрелость
 
-| Статус | Версия | Что будет                             | Зачем это нужно                                                  |
-| ------ | ------ | ------------------------------------- | ---------------------------------------------------------------- |
-| [ ]    | TBD    | Бенчмарки производительности          | Заранее задают реалистичные ожидания по скорости и компромиссам. |
-| [ ]    | TBD    | Примеры интеграции                    | Показывают, как библиотека встраивается в типовые стеки.         |
-| [ ]    | TBD    | Гайды по миграции                     | Упрощают переход со старых inflight-пакетов.                     |
-| [ ]    | TBD    | Вспомогательные API для типовых задач | Добавляют удобство в частых сценариях использования.             |
+| Статус | Версия | Что будет                                  | Зачем это нужно                                                                    |
+| ------ | ------ | ------------------------------------------ | ---------------------------------------------------------------------------------- |
+| [ ]    | 0.4.0  | Hooks для логов и метрик                   | Упрощают отправку shared, cache и stale сигналов во внешнюю observability-систему. |
+| [ ]    | 0.4.0  | Опциональные лимиты параллелизма на группу | Помогают беречь хрупкие внешние зависимости без превращения coflight в scheduler.  |
+| [ ]    | TBD    | Бенчмарки производительности               | Заранее задают реалистичные ожидания по скорости и компромиссам.                   |
+| [ ]    | TBD    | Гайды по миграции                          | Упрощают переход со старых inflight-пакетов.                                       |
+
+Retry и backoff пока намеренно не входят в roadmap ядра. Для реальных сервисов они полезны, но их политика слишком сильно зависит от транспорта, идемпотентности и классификации ошибок, чтобы жёстко вшивать её в маленькую библиотеку для coalescing.
 
 ## Установка
 
