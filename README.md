@@ -9,9 +9,9 @@
 
 ## The Problem
 
-When multiple parts of your application simultaneously request the same resource — the same API endpoint, database query, or expensive computation — each request triggers a separate operation. This wastes resources, increases latency, and can cause **cache stampede**.
+When multiple parts of your application simultaneously request the same resource, the same API endpoint, database query, or expensive computation, each request can trigger a separate operation. That wastes resources, increases latency, and can cause cache stampede.
 
-**coflight** coalesces concurrent calls by key: the first caller triggers the real work, and all subsequent callers with the same key await the same result.
+**coflight** coalesces concurrent calls by key: the first caller starts the real work, and every later caller with the same key awaits the same result.
 
 ### Why not existing packages?
 
@@ -20,18 +20,51 @@ When multiple parts of your application simultaneously request the same resource
 | [`inflight`](https://www.npmjs.com/package/inflight)                   | **Deprecated**, known memory leaks, 60M+ weekly downloads as a zombie dependency |
 | [`promise-inflight`](https://www.npmjs.com/package/promise-inflight)   | Last published 9 years ago, no tests                                             |
 | [`node-singleflight`](https://www.npmjs.com/package/node-singleflight) | No timeout, memory leak risk with many listeners                                 |
-| [`lru-cache`](https://www.npmjs.com/package/lru-cache)                 | Full cache engine — too heavy when all you need is dedup                         |
+| [`lru-cache`](https://www.npmjs.com/package/lru-cache)                 | Full cache engine, too heavy when all you need is dedup                          |
 
 ## Features
 
 - **Zero dependencies**
 - **First-class TypeScript** with full generic support
 - **ESM + CJS** dual package
-- **Per-subscriber `AbortSignal`** — each caller can independently cancel without affecting others
+- **Per-subscriber `AbortSignal`** so one caller can cancel without affecting the others
 - **Timeout** per subscriber
-- **Short TTL cache** — optionally cache results for a short period after completion
-- **`staleIfError`** — return last successful result if the current operation fails
+- **Short TTL cache** for reusing fresh results right after completion
+- **`staleIfError`** to return the last successful result when the current operation fails
 - **Node.js 18+**
+
+## Roadmap
+
+This roadmap shows the improvements users can expect in future releases.
+
+Status legend: `[ ]` planned, `[x]` done. The version column shows the release where the item shipped; `TBD` means the target release is still open.
+
+### Phase 1: Visibility and Control
+
+| Status | Version | What will be added        | Why it matters                                                   |
+| ------ | ------- | ------------------------- | ---------------------------------------------------------------- |
+| [ ]    | TBD     | Better runtime stats      | Makes shared work and cache usage easier to understand.          |
+| [ ]    | TBD     | Clearer result source     | Shows whether a result came from a shared request or from cache. |
+| [ ]    | TBD     | Cache warm-up support     | Lets hot paths be prepared before real traffic arrives.          |
+| [ ]    | TBD     | Safer stale-result limits | Keeps stale data useful without letting it grow out of control.  |
+
+### Phase 2: Smarter Freshness
+
+| Status | Version | What will be added                | Why it matters                                                    |
+| ------ | ------- | --------------------------------- | ----------------------------------------------------------------- |
+| [ ]    | TBD     | Background refresh for stale data | Keeps responses fast while data updates happen in the background. |
+| [ ]    | TBD     | Safer shutdown behavior           | Makes service shutdown with active requests more predictable.     |
+| [ ]    | TBD     | Easier monitoring integration     | Makes logs and metrics simpler to connect in real services.       |
+| [ ]    | TBD     | More practical examples           | Reduces integration mistakes in real applications.                |
+
+### Phase 3: Production Maturity
+
+| Status | Version | What will be added           | Why it matters                                             |
+| ------ | ------- | ---------------------------- | ---------------------------------------------------------- |
+| [ ]    | TBD     | Performance benchmarks       | Sets realistic expectations about speed and tradeoffs.     |
+| [ ]    | TBD     | Integration examples         | Shows how the library fits into common application stacks. |
+| [ ]    | TBD     | Migration guides             | Makes it easier to move off older inflight-style packages. |
+| [ ]    | TBD     | Helper APIs for common cases | Adds convenience for recurring usage patterns.             |
 
 ## Install
 
@@ -132,7 +165,7 @@ Caller C ─┘                         │                   │
 1. **First call** with a key starts the real operation.
 2. **Subsequent calls** with the same key join the in-flight operation.
 3. When the operation completes, **all callers receive the result**.
-4. With `ttl`, the result is cached for a short period — no new operation runs.
+4. With `ttl`, the result is cached for a short period, so no new operation runs.
 5. Each caller can independently abort via their own `AbortSignal`.
 6. Only when **all** callers have aborted is the shared operation cancelled.
 
@@ -143,9 +176,9 @@ Each subscriber can pass its own `AbortSignal`. When a subscriber aborts:
 - That subscriber's promise rejects with `AbortError`.
 - Other subscribers are **not affected**.
 - The underlying operation continues as long as at least one subscriber remains.
-- When **every** subscriber has aborted, the shared `AbortSignal` (passed to `fn`) is aborted too.
+- When **every** subscriber has aborted, the shared `AbortSignal` passed to `fn` is aborted too.
 
-All internal listeners use `{ once: true }` to prevent memory leaks — no matter how many subscribers join.
+All internal listeners use `{ once: true }` to prevent memory leaks, no matter how many subscribers join.
 
 ## Usage Examples
 
@@ -185,7 +218,7 @@ async function renderPage(slug: string): Promise<string> {
 ```typescript
 const jobs = createCoflight<string, void>();
 
-// Even if cron fires twice — work runs once
+// Even if cron fires twice, work runs once
 cron.schedule("*/5 * * * *", () => {
   jobs.run("sync-orders", () => syncOrders());
 });
@@ -233,7 +266,7 @@ MIT
 
 ## Проблема
 
-Когда несколько частей приложения одновременно запрашивают один и тот же ресурс — тот же API-эндпоинт, запрос к БД или тяжёлое вычисление — каждый запрос запускает отдельную операцию. Это расходует ресурсы, увеличивает задержки и может вызвать **cache stampede** (лавинный перезапрос).
+Когда несколько частей приложения одновременно запрашивают один и тот же ресурс, один и тот же API-эндпоинт, запрос к БД или тяжёлое вычисление, каждый запрос может запускать отдельную операцию. Это расходует ресурсы, увеличивает задержки и может вызвать лавинный перезапрос.
 
 **coflight** объединяет параллельные вызовы по ключу: первый вызов запускает реальную работу, а все последующие с тем же ключом ждут и получают тот же результат.
 
@@ -244,18 +277,49 @@ MIT
 | [`inflight`](https://www.npmjs.com/package/inflight)                   | **Deprecated**, известные утечки памяти, 60M+ скачиваний в неделю как зомби-зависимость |
 | [`promise-inflight`](https://www.npmjs.com/package/promise-inflight)   | Последняя публикация 9 лет назад, тестов нет                                            |
 | [`node-singleflight`](https://www.npmjs.com/package/node-singleflight) | Нет timeout, риск утечки памяти при большом числе listener'ов                           |
-| [`lru-cache`](https://www.npmjs.com/package/lru-cache)                 | Полноценный кеш-движок — слишком тяжёлый, когда нужен только dedup                      |
+| [`lru-cache`](https://www.npmjs.com/package/lru-cache)                 | Полноценный кеш-движок, слишком тяжёлый, когда нужен только dedup                       |
 
 ## Возможности
 
 - **Ноль зависимостей**
-- **Полноценная поддержка TypeScript** с дженериками
-- **ESM + CJS** — двойной формат пакета
-- **Per-subscriber `AbortSignal`** — каждый вызывающий может отменить свой запрос независимо от других
-- **Timeout** для каждого подписчика
-- **Короткий TTL-кеш** — возможность кешировать результат на заданное время после завершения
-- **`staleIfError`** — вернуть последний успешный результат, если текущая операция упала
+- **Полная поддержка TypeScript** с дженериками
+- **ESM + CJS** — пакет публикуется в обоих форматах
+- **Индивидуальный `AbortSignal` для каждого подписчика** — один вызывающий может отменить свой запрос, не затрагивая остальных
+- **Таймаут** для каждого подписчика
+- **Короткий TTL-кеш** — позволяет повторно использовать свежий результат сразу после завершения
+- **`staleIfError`** — возвращает последний успешный результат, если текущая операция завершилась ошибкой
 - **Node.js 18+**
+
+## Дорожная карта
+
+Обозначения статуса: `[ ]` запланировано, `[x]` сделано. В колонке версии указан релиз, в котором пункт вышел; `TBD` означает, что конкретная версия пока не назначена.
+
+### Фаза 1: Наблюдаемость и контроль
+
+| Статус | Версия | Что будет                      | Зачем это нужно                                                          |
+| ------ | ------ | ------------------------------ | ------------------------------------------------------------------------ |
+| [ ]    | TBD    | Более понятная статистика      | Показывает, как часто работа реально разделяется и как используется кеш. |
+| [ ]    | TBD    | Понятный источник результата   | Показывает, пришёл ли результат из общего запроса или из кеша.           |
+| [ ]    | TBD    | Поддержка прогрева кеша        | Позволяет заранее подготовить горячие пути до прихода нагрузки.          |
+| [ ]    | TBD    | Безопасные лимиты stale-данных | Помогает держать устаревшие данные под контролем.                        |
+
+### Фаза 2: Более умная свежесть
+
+| Статус | Версия | Что будет                             | Зачем это нужно                                                     |
+| ------ | ------ | ------------------------------------- | ------------------------------------------------------------------- |
+| [ ]    | TBD    | Фоновое обновление stale-данных       | Позволяет быстро отвечать пользователю и обновлять данные в фоне.   |
+| [ ]    | TBD    | Более безопасное завершение сервиса   | Делает остановку сервиса с активными запросами более предсказуемой. |
+| [ ]    | TBD    | Более простое подключение мониторинга | Упрощает подключение логирования, метрик и внешнего мониторинга.    |
+| [ ]    | TBD    | Больше практических примеров          | Снижает вероятность ошибок при интеграции.                          |
+
+### Фаза 3: Production-зрелость
+
+| Статус | Версия | Что будет                             | Зачем это нужно                                                  |
+| ------ | ------ | ------------------------------------- | ---------------------------------------------------------------- |
+| [ ]    | TBD    | Бенчмарки производительности          | Заранее задают реалистичные ожидания по скорости и компромиссам. |
+| [ ]    | TBD    | Примеры интеграции                    | Показывают, как библиотека встраивается в типовые стеки.         |
+| [ ]    | TBD    | Гайды по миграции                     | Упрощают переход со старых inflight-пакетов.                     |
+| [ ]    | TBD    | Вспомогательные API для типовых задач | Добавляют удобство в частых сценариях использования.             |
 
 ## Установка
 
@@ -300,10 +364,10 @@ async function getUser(id: string, signal?: AbortSignal): Promise<User> {
 
 ### `group.run(key, fn, options?)`
 
-Выполняет `fn` для данного ключа, либо присоединяется к уже выполняющемуся вызову.
+Выполняет `fn` для данного ключа или присоединяется к уже выполняющемуся вызову.
 
 - **`key: K`** — ключ дедупликации.
-- **`fn: (ctx: { signal: AbortSignal }) => Promise<V> | V`** — выполняемая функция. Вызывается только для **первого** вызова; все остальные разделяют тот же результат.
+- **`fn: (ctx: { signal: AbortSignal }) => Promise<V> | V`** — функция, которая будет выполнена. Вызывается только для **первого** запроса; последующие подписчики получают тот же результат.
 - **`options?`** — см. ниже.
 
 Возвращает `Promise<V>`.
@@ -314,14 +378,14 @@ async function getUser(id: string, signal?: AbortSignal): Promise<User> {
 | -------------- | ------------- | ----------------------------------------------------------------------------------------------- |
 | `signal`       | `AbortSignal` | Персональный сигнал отмены. **Не** отменяет общую операцию, пока **все** подписчики не отменят. |
 | `timeout`      | `number`      | Персональный таймаут в мс. Реджектится с `TimeoutError` при превышении.                         |
-| `ttl`          | `number`      | Кешировать результат N мс после завершения. Задаётся первым вызывающим.                         |
-| `staleIfError` | `boolean`     | Если `true` и операция провалилась — вернуть последний успешный результат (если есть).          |
+| `ttl`          | `number`      | Кешировать результат на указанное количество мс после завершения. Задаётся первым вызывающим.   |
+| `staleIfError` | `boolean`     | Если `true` и операция провалилась, вернуть последний успешный результат для этого ключа.       |
 
 ---
 
 ### `group.forget(key)`
 
-Удаляет `key` из карты полётов, TTL-кеша и stale-хранилища. Уже подписанные вызывающие продолжают получать свой результат.
+Удаляет `key` из карты полётов, TTL-кеша и хранилища stale-результатов. Уже подписанные вызывающие продолжают получать свой результат.
 
 Возвращает `boolean` — `true`, если ключ был найден.
 
@@ -329,7 +393,7 @@ async function getUser(id: string, signal?: AbortSignal): Promise<User> {
 
 ### `group.clear()`
 
-Удаляет все записи (полёты, кеш, stale-результаты).
+Удаляет все записи: полёты, кеш и stale-результаты.
 
 ---
 
@@ -356,20 +420,20 @@ async function getUser(id: string, signal?: AbortSignal): Promise<User> {
 1. **Первый вызов** с ключом запускает реальную операцию.
 2. **Последующие вызовы** с тем же ключом присоединяются к текущей операции.
 3. Когда операция завершается, **все вызывающие получают результат**.
-4. С `ttl` результат кешируется на заданный период — новая операция не запускается.
+4. С `ttl` результат кешируется на короткий период, поэтому новая операция не запускается.
 5. Каждый вызывающий может независимо отменить запрос через свой `AbortSignal`.
-6. Общая операция отменяется только когда **все** вызывающие отменили запрос.
+6. Общая операция отменяется только тогда, когда **все** вызывающие отменили запрос.
 
-## Поведение отмены (Abort)
+## Поведение отмены
 
 Каждый подписчик может передать свой `AbortSignal`. Когда подписчик отменяет запрос:
 
 - Promise этого подписчика реджектится с `AbortError`.
 - Другие подписчики **не затрагиваются**.
 - Нижележащая операция продолжается, пока остаётся хотя бы один активный подписчик.
-- Когда **все** подписчики отменили — общий `AbortSignal`, переданный в `fn`, тоже отменяется.
+- Когда **все** подписчики отменили запрос, общий `AbortSignal`, переданный в `fn`, тоже отменяется.
 
-Все внутренние listener'ы используют `{ once: true }` для предотвращения утечек памяти.
+Все внутренние listener'ы используют `{ once: true }`, чтобы не накапливать лишние обработчики.
 
 ## Примеры использования
 
@@ -409,7 +473,7 @@ async function renderPage(slug: string): Promise<string> {
 ```typescript
 const jobs = createCoflight<string, void>();
 
-// Даже если cron сработал дважды — работа выполнится один раз
+// Даже если cron сработал дважды, работа выполнится один раз
 cron.schedule("*/5 * * * *", () => {
   jobs.run("sync-orders", () => syncOrders());
 });
