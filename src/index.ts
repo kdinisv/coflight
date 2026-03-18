@@ -7,6 +7,8 @@ export interface CoflightOptions {
   ttl?: number;
   /** If `true` and the operation fails, return the last successful result for this key (if any). */
   staleIfError?: boolean;
+  /** If `true` and a stale result exists, return it immediately and refresh in the background. */
+  swr?: boolean;
 }
 
 export interface CoflightCreateOptions {
@@ -60,6 +62,12 @@ export interface CoflightStats {
   aborts: number;
   /** Number of subscribers rejected by timeout. */
   timeouts: number;
+  /** Number of subscribers that received a stale result via stale-while-revalidate. */
+  swrHits: number;
+  /** Number of background refresh operations started. */
+  backgroundRefreshes: number;
+  /** Number of background refresh operations that failed. */
+  backgroundRefreshFailures: number;
 }
 
 export interface CoflightGroup<K extends string = string, V = unknown> {
@@ -95,6 +103,26 @@ export interface CoflightGroup<K extends string = string, V = unknown> {
 
   /** Snapshot of live counts and cumulative runtime counters. */
   stats(): CoflightStats;
+
+  /** Force a fresh execution for the given key, bypassing the TTL cache. */
+  refresh(
+    key: K,
+    fn: (ctx: CoflightContext) => Promise<V> | V,
+    options?: CoflightOptions,
+  ): Promise<V>;
+
+  /** Like `refresh`, but also reports the result source. */
+  refreshDetailed(
+    key: K,
+    fn: (ctx: CoflightContext) => Promise<V> | V,
+    options?: CoflightOptions,
+  ): Promise<CoflightRunResult<V>>;
+
+  /** Stop accepting new work and wait for all in-flight operations to complete. */
+  drain(): Promise<void>;
+
+  /** Abort all in-flight operations and clear all state immediately. */
+  shutdown(): void;
 }
 
 interface Flight<V> {
@@ -131,6 +159,9 @@ export function createCoflight<K extends string = string, V = unknown>(
   const flights = new Map<K, Flight<V>>();
   const cache = new Map<K, CacheEntry<V>>();
   const staleStore = new Map<K, StaleEntry<V>>();
+  let draining = false;
+  const drainResolvers: (() => void)[] = [];
+
   const counters = {
     requests: 0,
     freshRuns: 0,
@@ -140,6 +171,9 @@ export function createCoflight<K extends string = string, V = unknown>(
     warmups: 0,
     aborts: 0,
     timeouts: 0,
+    swrHits: 0,
+    backgroundRefreshes: 0,
+    backgroundRefreshFailures: 0,
   };
 
   function clearCacheEntry(key: K): boolean {
@@ -224,6 +258,71 @@ export function createCoflight<K extends string = string, V = unknown>(
     return true;
   }
 
+  function launchFlight(
+    key: K,
+    fn: (ctx: CoflightContext) => Promise<V> | V,
+    ttl: number | undefined,
+    onError?: () => void,
+  ): Flight<V> {
+    const controller = new AbortController();
+    const promise = new Promise<V>((resolve, reject) => {
+      try {
+        resolve(fn({ signal: controller.signal }));
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    const flight: Flight<V> = {
+      promise,
+      controller,
+      subscribers: 0,
+      settled: false,
+      ttl,
+    };
+
+    flights.set(key, flight);
+
+    promise.then(
+      (value) => {
+        flight.settled = true;
+        storeStaleValue(key, value);
+        if (flights.get(key) === flight) {
+          flights.delete(key);
+          storeCachedValue(key, value, flight.ttl);
+        }
+        checkDrainComplete();
+      },
+      () => {
+        flight.settled = true;
+        onError?.();
+        if (flights.get(key) === flight) flights.delete(key);
+        checkDrainComplete();
+      },
+    );
+
+    return flight;
+  }
+
+  function triggerBackgroundRefresh(
+    key: K,
+    fn: (ctx: CoflightContext) => Promise<V> | V,
+    ttl: number | undefined,
+  ): void {
+    counters.backgroundRefreshes++;
+    const flight = launchFlight(key, fn, ttl, () => {
+      counters.backgroundRefreshFailures++;
+    });
+    flight.subscribers = 1;
+  }
+
+  function checkDrainComplete(): void {
+    if (draining && flights.size === 0 && drainResolvers.length > 0) {
+      const resolvers = drainResolvers.splice(0);
+      for (const resolve of resolvers) resolve();
+    }
+  }
+
   function run(
     key: K,
     fn: (ctx: CoflightContext) => Promise<V> | V,
@@ -239,10 +338,25 @@ export function createCoflight<K extends string = string, V = unknown>(
   ): Promise<CoflightRunResult<V>> {
     counters.requests++;
 
+    if (draining) {
+      return Promise.reject(new Error("Group is shutting down"));
+    }
+
     const cached = cache.get(key);
     if (cached) {
       counters.cacheHits++;
       return Promise.resolve({ value: cached.value, source: "cache" });
+    }
+
+    if (options?.swr) {
+      const staleValue = getStaleValue(key);
+      if (staleValue !== undefined) {
+        if (!flights.has(key)) {
+          triggerBackgroundRefresh(key, fn, options?.ttl);
+        }
+        counters.swrHits++;
+        return Promise.resolve({ value: staleValue, source: "stale" });
+      }
     }
 
     let source: CoflightResultSource = "fresh";
@@ -250,40 +364,7 @@ export function createCoflight<K extends string = string, V = unknown>(
 
     if (!flight) {
       counters.freshRuns++;
-      const controller = new AbortController();
-      const promise = new Promise<V>((resolve, reject) => {
-        try {
-          resolve(fn({ signal: controller.signal }));
-        } catch (err) {
-          reject(err);
-        }
-      });
-
-      flight = {
-        promise,
-        controller,
-        subscribers: 0,
-        settled: false,
-        ttl: options?.ttl,
-      };
-
-      flights.set(key, flight);
-
-      const currentFlight = flight;
-      promise.then(
-        (value) => {
-          currentFlight.settled = true;
-          storeStaleValue(key, value);
-          if (flights.get(key) === currentFlight) {
-            flights.delete(key);
-            storeCachedValue(key, value, currentFlight.ttl);
-          }
-        },
-        () => {
-          currentFlight.settled = true;
-          if (flights.get(key) === currentFlight) flights.delete(key);
-        },
-      );
+      flight = launchFlight(key, fn, options?.ttl);
     } else {
       source = "shared";
       counters.sharedRuns++;
@@ -379,7 +460,7 @@ export function createCoflight<K extends string = string, V = unknown>(
   }
 
   function warm(key: K, value: V, options?: CoflightWarmOptions): boolean {
-    if (flights.has(key)) return false;
+    if (draining || flights.has(key)) return false;
 
     const cached = storeCachedValue(key, value, options?.ttl);
     const stale =
@@ -391,6 +472,23 @@ export function createCoflight<K extends string = string, V = unknown>(
     return true;
   }
 
+  function refresh(
+    key: K,
+    fn: (ctx: CoflightContext) => Promise<V> | V,
+    options?: CoflightOptions,
+  ): Promise<V> {
+    return refreshDetailed(key, fn, options).then((result) => result.value);
+  }
+
+  function refreshDetailed(
+    key: K,
+    fn: (ctx: CoflightContext) => Promise<V> | V,
+    options?: CoflightOptions,
+  ): Promise<CoflightRunResult<V>> {
+    clearCacheEntry(key);
+    return runDetailed(key, fn, options);
+  }
+
   function forget(key: K): boolean {
     const hadFlight = flights.delete(key);
     const hadCache = clearCacheEntry(key);
@@ -398,11 +496,15 @@ export function createCoflight<K extends string = string, V = unknown>(
     return hadFlight || hadCache || hadStale;
   }
 
-  function clear(): void {
+  function clearAllStores(): void {
     flights.clear();
     for (const entry of cache.values()) clearTimeout(entry.timer);
     cache.clear();
     staleStore.clear();
+  }
+
+  function clear(): void {
+    clearAllStores();
   }
 
   function isRunning(key: K): boolean {
@@ -424,8 +526,50 @@ export function createCoflight<K extends string = string, V = unknown>(
       warmups: counters.warmups,
       aborts: counters.aborts,
       timeouts: counters.timeouts,
+      swrHits: counters.swrHits,
+      backgroundRefreshes: counters.backgroundRefreshes,
+      backgroundRefreshFailures: counters.backgroundRefreshFailures,
     };
   }
 
-  return { run, runDetailed, warm, forget, clear, isRunning, stats };
+  function drain(): Promise<void> {
+    draining = true;
+    if (flights.size === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      drainResolvers.push(resolve);
+    });
+  }
+
+  function shutdown(): void {
+    draining = true;
+    for (const flight of flights.values()) {
+      if (!flight.settled) flight.controller.abort();
+    }
+    clearAllStores();
+    const resolvers = drainResolvers.splice(0);
+    for (const resolve of resolvers) resolve();
+  }
+
+  return {
+    run,
+    runDetailed,
+    warm,
+    refresh,
+    refreshDetailed,
+    forget,
+    clear,
+    isRunning,
+    stats,
+    drain,
+    shutdown,
+  };
 }
+
+export {
+  composeKey,
+  escapeKeySegment,
+  createKeyFactory,
+  createScopedKeyFactory,
+  createKeyNamespace,
+} from "./keys.js";
+export type { KeyFactory, KeyNamespace } from "./keys.js";

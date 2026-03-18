@@ -188,6 +188,9 @@ describe("stats", () => {
       warmups: 0,
       aborts: 0,
       timeouts: 0,
+      swrHits: 0,
+      backgroundRefreshes: 0,
+      backgroundRefreshFailures: 0,
     });
 
     const p = group.run("key", () => delay(30).then(() => 1), { ttl: 5000 });
@@ -687,5 +690,341 @@ describe("error propagation", () => {
 
     expect(callCount).toBe(2);
     expect(result).toBe(99);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SWR (stale-while-revalidate)
+// ---------------------------------------------------------------------------
+
+describe("swr", () => {
+  it("returns stale immediately and triggers background refresh", async () => {
+    const group = createCoflight<string, number>();
+    let callCount = 0;
+
+    // Seed stale
+    await group.run("key", async () => {
+      callCount++;
+      return 1;
+    });
+    expect(callCount).toBe(1);
+
+    // SWR: should return stale value (1) and start background refresh
+    const result = await group.runDetailed(
+      "key",
+      async () => {
+        callCount++;
+        await delay(30);
+        return 2;
+      },
+      { swr: true },
+    );
+
+    expect(result).toEqual({ value: 1, source: "stale" });
+    expect(group.stats().swrHits).toBe(1);
+    expect(group.stats().backgroundRefreshes).toBe(1);
+
+    // Wait for background refresh to complete
+    await delay(50);
+
+    // Now the refreshed value should be in stale store & cache
+    const after = await group.runDetailed("key", async () => 99, { swr: true });
+    // Background refresh stored value 2 in cache, so SWR check shouldn't even fire
+    // However TTL wasn't set, so no cache → stale (value 2) → swr returns it
+    expect(after.value).toBe(2);
+  });
+
+  it("returns cache if cache hit exists, even with swr: true", async () => {
+    const group = createCoflight<string, number>();
+
+    await group.run("key", async () => 42, { ttl: 5000 });
+
+    const result = await group.runDetailed("key", async () => 99, {
+      swr: true,
+    });
+    expect(result).toEqual({ value: 42, source: "cache" });
+  });
+
+  it("does not start a second refresh if one is already running", async () => {
+    const group = createCoflight<string, number>();
+
+    await group.run("key", async () => 1);
+
+    // First SWR triggers background refresh
+    await group.runDetailed(
+      "key",
+      async () => {
+        await delay(100);
+        return 2;
+      },
+      { swr: true },
+    );
+
+    // Second SWR while refresh is still running — should NOT start another
+    await group.runDetailed(
+      "key",
+      async () => {
+        await delay(100);
+        return 3;
+      },
+      { swr: true },
+    );
+
+    expect(group.stats().backgroundRefreshes).toBe(1);
+    expect(group.stats().swrHits).toBe(2);
+
+    await delay(120);
+  });
+
+  it("falls through to fresh when no stale value exists", async () => {
+    const group = createCoflight<string, number>();
+
+    const result = await group.runDetailed("key", async () => 42, {
+      swr: true,
+    });
+
+    expect(result).toEqual({ value: 42, source: "fresh" });
+    expect(group.stats().swrHits).toBe(0);
+    expect(group.stats().backgroundRefreshes).toBe(0);
+  });
+
+  it("background refresh failure does not lose stale value", async () => {
+    const group = createCoflight<string, number>();
+
+    await group.run("key", async () => 1);
+
+    // SWR triggers a failing background refresh
+    await group.runDetailed(
+      "key",
+      async () => {
+        throw new Error("refresh-fail");
+      },
+      { swr: true },
+    );
+
+    await delay(20);
+
+    expect(group.stats().backgroundRefreshFailures).toBe(1);
+
+    // Stale value should still be available
+    const after = await group.runDetailed("key", async () => 99, { swr: true });
+    expect(after.value).toBe(1);
+  });
+
+  it("foreground caller can join a background refresh flight", async () => {
+    const group = createCoflight<string, number>();
+    let callCount = 0;
+
+    await group.run("key", async () => {
+      callCount++;
+      return 1;
+    });
+
+    // SWR returns stale, background refresh starts
+    const swrResult = await group.runDetailed(
+      "key",
+      async () => {
+        callCount++;
+        await delay(60);
+        return 2;
+      },
+      { swr: true },
+    );
+    expect(swrResult.value).toBe(1);
+
+    // Foreground caller joins the background refresh flight
+    const joined = await group.runDetailed("key", async () => {
+      callCount++;
+      return 3;
+    });
+    expect(joined).toEqual({ value: 2, source: "shared" });
+    expect(callCount).toBe(2); // fn called only twice (original + background)
+  });
+});
+
+// ---------------------------------------------------------------------------
+// refresh
+// ---------------------------------------------------------------------------
+
+describe("refresh", () => {
+  it("bypasses TTL cache and starts a new flight", async () => {
+    const group = createCoflight<string, number>();
+    let callCount = 0;
+
+    await group.run("key", async () => ++callCount, { ttl: 10_000 });
+    expect(callCount).toBe(1);
+
+    // Normal run would hit cache
+    const cached = await group.run("key", async () => ++callCount);
+    expect(cached).toBe(1);
+    expect(callCount).toBe(1);
+
+    // Refresh bypasses cache
+    const refreshed = await group.refresh("key", async () => ++callCount);
+    expect(refreshed).toBe(2);
+    expect(callCount).toBe(2);
+  });
+
+  it("joins an existing flight if one is running", async () => {
+    const group = createCoflight<string, number>();
+    let callCount = 0;
+
+    const p1 = group.run("key", async () => {
+      callCount++;
+      await delay(50);
+      return 42;
+    });
+
+    const p2 = group.refresh("key", async () => ++callCount);
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1).toBe(42);
+    expect(r2).toBe(42);
+    expect(callCount).toBe(1);
+  });
+
+  it("refreshDetailed reports source correctly", async () => {
+    const group = createCoflight<string, number>();
+
+    await group.run("key", async () => 1, { ttl: 10_000 });
+
+    const result = await group.refreshDetailed("key", async () => 2);
+    expect(result).toEqual({ value: 2, source: "fresh" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// drain
+// ---------------------------------------------------------------------------
+
+describe("drain", () => {
+  it("resolves immediately when no flights are active", async () => {
+    const group = createCoflight<string, number>();
+    await group.drain();
+    // No timeout — resolved synchronously
+  });
+
+  it("waits for active flights to complete", async () => {
+    const group = createCoflight<string, number>();
+    let completed = false;
+
+    const p = group.run("key", async () => {
+      await delay(50);
+      completed = true;
+      return 1;
+    });
+
+    const drainPromise = group.drain();
+
+    // drain hasn't resolved yet because flight is still running
+    expect(completed).toBe(false);
+
+    await drainPromise;
+    expect(completed).toBe(true);
+
+    await p;
+  });
+
+  it("rejects new run() calls after drain", async () => {
+    const group = createCoflight<string, number>();
+
+    group.drain();
+
+    await expect(group.run("key", async () => 1)).rejects.toThrow(
+      "Group is shutting down",
+    );
+  });
+
+  it("returns false from warm() after drain", async () => {
+    const group = createCoflight<string, number>();
+
+    group.drain();
+
+    expect(group.warm("key", 42, { ttl: 1000 })).toBe(false);
+  });
+
+  it("waits for background refresh too", async () => {
+    const group = createCoflight<string, number>();
+
+    // Seed stale
+    await group.run("key", async () => 1);
+
+    // SWR triggers background refresh
+    await group.runDetailed(
+      "key",
+      async () => {
+        await delay(50);
+        return 2;
+      },
+      { swr: true },
+    );
+
+    // Immediately drain — should wait for the background refresh
+    const drainPromise = group.drain();
+    expect(group.stats().inflight).toBe(1);
+
+    await drainPromise;
+    expect(group.stats().inflight).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// shutdown
+// ---------------------------------------------------------------------------
+
+describe("shutdown", () => {
+  it("aborts all active flights", async () => {
+    const group = createCoflight<string, number>();
+    let sharedSignal: AbortSignal | null = null;
+
+    const p = group.run("key", async ({ signal }) => {
+      sharedSignal = signal;
+      await delay(200);
+      return 1;
+    });
+
+    group.shutdown();
+
+    expect(sharedSignal!.aborted).toBe(true);
+    expect(group.stats().inflight).toBe(0);
+
+    // The subscriber should eventually settle (its promise was already handed out)
+    await p.catch(() => {});
+  });
+
+  it("rejects new run() calls after shutdown", async () => {
+    const group = createCoflight<string, number>();
+
+    group.shutdown();
+
+    await expect(group.run("key", async () => 1)).rejects.toThrow(
+      "Group is shutting down",
+    );
+  });
+
+  it("resolves pending drain promises", async () => {
+    const group = createCoflight<string, number>();
+
+    group.run("key", () => delay(200).then(() => 1));
+
+    const drainPromise = group.drain();
+
+    group.shutdown();
+
+    // drain should resolve because shutdown cleared everything
+    await drainPromise;
+  });
+
+  it("clears cache and stale stores", async () => {
+    const group = createCoflight<string, number>();
+
+    await group.run("key", async () => 1, { ttl: 10_000 });
+    expect(group.stats().cached).toBe(1);
+    expect(group.stats().stale).toBe(1);
+
+    group.shutdown();
+
+    expect(group.stats().cached).toBe(0);
+    expect(group.stats().stale).toBe(0);
   });
 });

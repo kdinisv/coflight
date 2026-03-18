@@ -7,76 +7,31 @@
 
 ---
 
-## The Problem
-
-When multiple parts of your application simultaneously request the same resource, the same API endpoint, database query, or expensive computation, each request can trigger a separate operation. That wastes resources, increases latency, and can cause cache stampede.
-
-**coflight** coalesces concurrent calls by key: the first caller starts the real work, and every later caller with the same key awaits the same result.
-
-### Why not existing packages?
-
-| Package                                                                | Problem                                                                          |
-| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| [`inflight`](https://www.npmjs.com/package/inflight)                   | **Deprecated**, known memory leaks, 60M+ weekly downloads as a zombie dependency |
-| [`promise-inflight`](https://www.npmjs.com/package/promise-inflight)   | Last published 9 years ago, no tests                                             |
-| [`node-singleflight`](https://www.npmjs.com/package/node-singleflight) | No timeout, memory leak risk with many listeners                                 |
-| [`lru-cache`](https://www.npmjs.com/package/lru-cache)                 | Full cache engine, too heavy when all you need is dedup                          |
-
-## Features
-
-- **Zero dependencies**
-- **First-class TypeScript** with full generic support
-- **ESM + CJS** dual package
-- **Per-subscriber `AbortSignal`** so one caller can cancel without affecting the others
-- **Timeout** per subscriber
-- **Short TTL cache** for reusing fresh results right after completion
-- **`staleIfError`** to return the last successful result when the current operation fails
-- **Node.js 18+**
-
-## Roadmap
-
-This roadmap shows the improvements users can expect in future releases.
-
-Status legend: `[ ]` planned, `[x]` done. The version column shows the release where the item shipped; `TBD` means the target release is still open.
-
-### Phase 1: Visibility and Control
-
-| Status | Version | What will be added        | Why it matters                                                   |
-| ------ | ------- | ------------------------- | ---------------------------------------------------------------- |
-| [x]    | 0.2.0   | Better runtime stats      | Makes shared work and cache usage easier to understand.          |
-| [x]    | 0.2.0   | Clearer result source     | Shows whether a result came from a shared request or from cache. |
-| [x]    | 0.2.0   | Cache warm-up support     | Lets hot paths be prepared before real traffic arrives.          |
-| [x]    | 0.2.0   | Safer stale-result limits | Keeps stale data useful without letting it grow out of control.  |
-
-### Phase 2: Smarter Freshness
-
-| Status | Version | What will be added                | Why it matters                                                             |
-| ------ | ------- | --------------------------------- | -------------------------------------------------------------------------- |
-| [ ]    | 0.3.0   | Background refresh for stale data | Keeps responses fast while stale values refresh quietly in the background. |
-| [ ]    | 0.3.0   | Safer key composition helpers     | Reduces cross-tenant and auth-scope mistakes when keys need more context.  |
-| [ ]    | 0.3.0   | More practical examples           | Shows how to structure keys and freshness rules in real services.          |
-| [ ]    | TBD     | Safer shutdown behavior           | Makes service shutdown with active requests more predictable.              |
-
-### Phase 3: Production Maturity
-
-| Status | Version | What will be added                    | Why it matters                                                                     |
-| ------ | ------- | ------------------------------------- | ---------------------------------------------------------------------------------- |
-| [ ]    | 0.4.0   | Metrics-friendly observability hooks  | Makes it easier to forward shared, cache, and stale signals into logs and metrics. |
-| [ ]    | 0.4.0   | Optional group-level concurrency caps | Protects fragile backends without turning coflight into a full scheduler.          |
-| [ ]    | TBD     | Performance benchmarks                | Sets realistic expectations about speed and tradeoffs.                             |
-| [ ]    | TBD     | Migration guides                      | Makes it easier to move off older inflight-style packages.                         |
-
-Retry and backoff are intentionally not on the core roadmap for now. They are useful for real services, but their policies depend too much on transport, idempotency, and error classification to hard-code them into a small coalescing library.
-
 ## Install
 
 ```bash
 npm install @kdinisv/coflight
 ```
 
+## What It Does
+
+Use coflight when several parts of your app can ask for the same resource at the same time:
+
+- the first call starts the real work
+- later calls with the same key wait for the same promise
+- optional TTL lets you reuse the fresh result for a short window
+- optional stale storage lets you fall back to the last successful value
+
+Typical cases:
+
+- API and database lookups
+- SSR and server loaders
+- expensive config or service-discovery fetches
+- cron or worker overlap protection
+
 ## Quick Start
 
-```typescript
+```ts
 import { createCoflight } from "@kdinisv/coflight";
 
 interface User {
@@ -86,219 +41,251 @@ interface User {
 
 const users = createCoflight<string, User>();
 
-// All concurrent calls with the same key share a single fetch
-async function getUser(id: string, signal?: AbortSignal): Promise<User> {
+export async function getUser(id: string, signal?: AbortSignal): Promise<User> {
   return users.run(
     `user:${id}`,
     ({ signal }) => fetch(`/api/users/${id}`, { signal }).then((r) => r.json()),
-    { signal, timeout: 3000, ttl: 5000 },
+    { signal, timeout: 3_000, ttl: 5_000 },
   );
 }
-
-users.warm("user:42", { id: "42", name: "Warm cache" }, { ttl: 2_000 });
-
-const detailed = await users.runDetailed("user:42", ({ signal }) =>
-  fetch(`/api/users/42`, { signal }).then((r) => r.json()),
-);
-
-console.log(detailed.source); // "cache"
 ```
+
+## Result Sources
+
+`runDetailed()` and `refreshDetailed()` return both the value and where it came from:
+
+- `fresh` — this call started the real operation
+- `shared` — this call joined an in-flight operation
+- `cache` — the value came from the TTL cache
+- `stale` — the value came from stale storage
 
 ## API
 
 ### `createCoflight<K, V>(options?)`
 
-Creates a new coalescing group.
+Creates an isolated coalescing group.
 
-- `K` — key type (extends `string`, default `string`)
-- `V` — value type (default `unknown`)
-- `options?.staleTtl` — max age for stale results in ms. Omit to keep stale results until replaced or forgotten. Set to `0` to disable stale retention.
-- `options?.maxStaleEntries` — upper bound for retained stale results. Omit for no limit. Set to `0` to disable stale retention.
+- `staleTtl?: number` — how long to keep stale values in ms. Omit to keep them until replaced or forgotten. Set `0` to disable stale storage.
+- `maxStaleEntries?: number` — maximum number of stale entries to retain. Omit for no limit. Set `0` to disable stale storage.
 
-Returns a `CoflightGroup<K, V>`.
-
----
+```ts
+const group = createCoflight<string, User>({
+  staleTtl: 60_000,
+  maxStaleEntries: 500,
+});
+```
 
 ### `group.run(key, fn, options?)`
 
-Execute `fn` for the given key, or join an already in-flight call.
+Runs `fn` for `key`, or joins an existing in-flight call with the same key.
 
-- **`key: K`** — deduplication key.
-- **`fn: (ctx: { signal: AbortSignal }) => Promise<V> | V`** — the function to execute. Only called for the **first** caller; subsequent callers share the same result.
-- **`options?`** — see below.
+```ts
+const value = await group.run(
+  "user:42",
+  ({ signal }) => loadUser("42", signal),
+  {
+    timeout: 2_000,
+    ttl: 5_000,
+  },
+);
+```
 
-Returns `Promise<V>`.
+Options:
 
-#### Options
-
-| Option         | Type          | Description                                                                                             |
-| -------------- | ------------- | ------------------------------------------------------------------------------------------------------- |
-| `signal`       | `AbortSignal` | Per-subscriber abort signal. Does **not** cancel the shared operation unless **all** subscribers abort. |
-| `timeout`      | `number`      | Per-subscriber timeout in ms. Rejects with `TimeoutError` if exceeded.                                  |
-| `ttl`          | `number`      | Cache the result for this many ms after completion. Set by the first caller.                            |
-| `staleIfError` | `boolean`     | If `true` and the operation fails, return the last successful result for this key (if any).             |
-
----
+- `signal?: AbortSignal` — per-caller cancellation
+- `timeout?: number` — per-caller timeout in ms
+- `ttl?: number` — cache successful result for this many ms
+- `staleIfError?: boolean` — return the last successful value if the fresh call fails
+- `swr?: boolean` — return stale immediately and refresh in the background
 
 ### `group.runDetailed(key, fn, options?)`
 
-Same execution model as `group.run`, but returns both the value and its source.
+Same behavior as `run`, but returns `{ value, source }`.
 
-Returns `Promise<{ value: V; source: "fresh" | "shared" | "cache" | "stale" }>`.
+```ts
+const result = await group.runDetailed("user:42", ({ signal }) =>
+  loadUser("42", signal),
+);
 
-- `fresh` — this subscriber started the real work.
-- `shared` — this subscriber joined an already running flight.
-- `cache` — the result came from the TTL cache.
-- `stale` — the real operation failed and `staleIfError` returned the last successful value.
-
----
+console.log(result.source);
+```
 
 ### `group.warm(key, value, options?)`
 
-Seed a key before traffic arrives.
+Seeds a value before traffic arrives.
 
-- `value: V` — value to place into warm storage.
-- `options?.ttl` — optional TTL cache window in ms.
-- `options?.stale` — whether to also seed the stale store. Defaults to `true`.
+- `ttl?: number` — add the value to TTL cache
+- `stale?: boolean` — also seed stale storage, defaults to `true`
 
-Returns `boolean` — `true` if cache or stale storage was written. Returns `false` when the key is already in-flight or when nothing could be stored.
+```ts
+group.warm("user:42", cachedUser, { ttl: 2_000 });
+```
 
----
+Returns `true` if something was stored.
+
+### `group.refresh(key, fn, options?)`
+
+Bypasses the TTL cache and forces a fresh execution. If the key is already running, the caller joins that in-flight work instead of starting a duplicate request.
+
+```ts
+await group.refresh("config:tenant-a", ({ signal }) =>
+  loadConfig("tenant-a", signal),
+);
+```
+
+### `group.refreshDetailed(key, fn, options?)`
+
+Same as `refresh`, but returns `{ value, source }`.
 
 ### `group.forget(key)`
 
-Remove `key` from the flight map, TTL cache, and stale result store. Existing subscribers continue to receive their result.
+Removes one key from tracked state.
 
-Returns `boolean` — `true` if the key was found.
-
----
+```ts
+group.forget("user:42");
+```
 
 ### `group.clear()`
 
-Remove all entries (flights, cache, stale results).
-
----
+Clears all tracked keys, cache entries, and stale values.
 
 ### `group.isRunning(key)`
 
-Returns `boolean` — whether there is an in-flight operation for the key.
-
----
+Returns `true` while a key is in flight.
 
 ### `group.stats()`
 
-Returns live counts plus cumulative runtime counters:
+Returns live counters and cumulative usage stats:
 
 ```ts
 {
-  inflight: number;
-  cached: number;
-  stale: number;
-  requests: number;
-  freshRuns: number;
-  sharedRuns: number;
-  cacheHits: number;
-  staleHits: number;
-  warmups: number;
-  aborts: number;
-  timeouts: number;
+  inflight,
+  cached,
+  stale,
+  requests,
+  freshRuns,
+  sharedRuns,
+  cacheHits,
+  staleHits,
+  warmups,
+  aborts,
+  timeouts,
+  swrHits,
+  backgroundRefreshes,
+  backgroundRefreshFailures,
 }
 ```
 
-## How It Works
+### `group.drain()`
 
+Stops accepting new work and waits for all in-flight operations, including SWR background refreshes, to finish.
+
+Use this for graceful shutdown when you want existing work to complete.
+
+### `group.shutdown()`
+
+Aborts all in-flight operations and clears stored state immediately.
+
+Use this when the process must stop now.
+
+## Patterns
+
+### TTL Cache
+
+```ts
+await group.run("article:home", fetchHomepage, { ttl: 10_000 });
 ```
-Caller A ─┐
-Caller B ─┼─→ run("user:42", fn) ─→ ONE fn() call ─→ result
-Caller C ─┘                         │                   │
-                                     └── all callers ←──┘
-                                         get the same result
+
+Use when a short burst of repeated reads should reuse a fresh result.
+
+### Stale On Error
+
+```ts
+await group.run("flags", loadFlags, { staleIfError: true });
 ```
 
-1. **First call** with a key starts the real operation.
-2. **Subsequent calls** with the same key join the in-flight operation.
-3. When the operation completes, **all callers receive the result**.
-4. With `ttl`, the result is cached for a short period, so no new operation runs.
-5. Each caller can independently abort via their own `AbortSignal`.
-6. Only when **all** callers have aborted is the shared operation cancelled.
+Use when serving the last good value is better than failing the request.
 
-## Abort Behaviour
+### Stale While Revalidate
 
-Each subscriber can pass its own `AbortSignal`. When a subscriber aborts:
+```ts
+await group.run("service:billing", lookupService, { swr: true });
+```
 
-- That subscriber's promise rejects with `AbortError`.
-- Other subscribers are **not affected**.
-- The underlying operation continues as long as at least one subscriber remains.
-- When **every** subscriber has aborted, the shared `AbortSignal` passed to `fn` is aborted too.
+Use when fast responses matter more than always blocking on a refresh.
 
-All internal listeners use `{ once: true }` to prevent memory leaks, no matter how many subscribers join.
+### Graceful Stop
 
-## Usage Examples
+```ts
+await group.drain();
+group.shutdown();
+```
 
-### API request deduplication
+Use `drain()` if you want current work to finish. Use `shutdown()` if you need to abort it.
 
-```typescript
-import { createCoflight } from "@kdinisv/coflight";
+## Key Helpers
 
-const api = createCoflight<string, any>();
+Available from both `@kdinisv/coflight` and `@kdinisv/coflight/keys`.
 
-app.get("/users/:id", async (req, res) => {
-  const user = await api.run(
-    `user:${req.params.id}`,
-    ({ signal }) => db.users.findById(req.params.id, { signal }),
-    { timeout: 5000, ttl: 2000 },
-  );
-  res.json(user);
+### `composeKey(...segments)`
+
+Builds a key from one or more escaped segments.
+
+```ts
+import { composeKey } from "@kdinisv/coflight";
+
+const key = composeKey("user", "tenant-a", "42");
+```
+
+### `createKeyFactory(prefix)`
+
+Creates a reusable prefixed key builder.
+
+```ts
+import { createKeyFactory } from "@kdinisv/coflight/keys";
+
+const userKey = createKeyFactory("user");
+
+userKey("42");
+userKey.scoped("tenant-a", "42");
+```
+
+### `createScopedKeyFactory(prefix, ...scopes)`
+
+Creates a key builder with fixed runtime arity.
+
+```ts
+import { createScopedKeyFactory } from "@kdinisv/coflight/keys";
+
+const configKey = createScopedKeyFactory("config", "tenantId", "env");
+
+configKey("acme", "prod");
+```
+
+### `createKeyNamespace(schema)`
+
+Creates a typed namespace of scoped key builders.
+
+```ts
+import { createKeyNamespace } from "@kdinisv/coflight/keys";
+
+const keys = createKeyNamespace({
+  user: ["tenantId", "userId"],
+  session: ["sessionId"],
 });
+
+keys.user("acme", "42");
+keys.session("sess-abc");
 ```
 
-### SSR data loading
+## Examples
 
-```typescript
-const loaders = createCoflight<string, PageData>();
+See the full examples in:
 
-async function renderPage(slug: string): Promise<string> {
-  const data = await loaders.run(`page:${slug}`, () => fetchPageData(slug), {
-    ttl: 10_000,
-    staleIfError: true,
-  });
-  return template(data);
-}
-```
-
-### Cron overlap protection
-
-```typescript
-const jobs = createCoflight<string, void>();
-
-// Even if cron fires twice, work runs once
-cron.schedule("*/5 * * * *", () => {
-  jobs.run("sync-orders", () => syncOrders());
-});
-```
-
-### Per-subscriber abort in WebSocket
-
-```typescript
-const flights = createCoflight<string, Report>();
-
-ws.on("message", async (msg) => {
-  const ac = new AbortController();
-  ws.once("cancel", () => ac.abort());
-
-  try {
-    const report = await flights.run(
-      `report:${msg.id}`,
-      ({ signal }) => generateReport(msg.id, { signal }),
-      { signal: ac.signal, timeout: 30_000 },
-    );
-    ws.send(JSON.stringify(report));
-  } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") return;
-    ws.send(JSON.stringify({ error: "failed" }));
-  }
-});
-```
+- [examples/auth-scoped-fetch.ts](examples/auth-scoped-fetch.ts)
+- [examples/multi-tenant-api.ts](examples/multi-tenant-api.ts)
+- [examples/swr-service-lookup.ts](examples/swr-service-lookup.ts)
+- [examples/graceful-shutdown.ts](examples/graceful-shutdown.ts)
 
 ## License
 
@@ -306,9 +293,7 @@ MIT
 
 ---
 
----
-
-# coflight (на русском)
+# coflight на русском
 
 [English](#coflight) | **Русский**
 
@@ -317,74 +302,31 @@ MIT
 
 ---
 
-## Проблема
-
-Когда несколько частей приложения одновременно запрашивают один и тот же ресурс, один и тот же API-эндпоинт, запрос к БД или тяжёлое вычисление, каждый запрос может запускать отдельную операцию. Это расходует ресурсы, увеличивает задержки и может вызвать лавинный перезапрос.
-
-**coflight** объединяет параллельные вызовы по ключу: первый вызов запускает реальную работу, а все последующие с тем же ключом ждут и получают тот же результат.
-
-### Почему не существующие пакеты?
-
-| Пакет                                                                  | Проблема                                                                                |
-| ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| [`inflight`](https://www.npmjs.com/package/inflight)                   | **Deprecated**, известные утечки памяти, 60M+ скачиваний в неделю как зомби-зависимость |
-| [`promise-inflight`](https://www.npmjs.com/package/promise-inflight)   | Последняя публикация 9 лет назад, тестов нет                                            |
-| [`node-singleflight`](https://www.npmjs.com/package/node-singleflight) | Нет timeout, риск утечки памяти при большом числе listener'ов                           |
-| [`lru-cache`](https://www.npmjs.com/package/lru-cache)                 | Полноценный кеш-движок, слишком тяжёлый, когда нужен только dedup                       |
-
-## Возможности
-
-- **Ноль зависимостей**
-- **Полная поддержка TypeScript** с дженериками
-- **ESM + CJS** — пакет публикуется в обоих форматах
-- **Индивидуальный `AbortSignal` для каждого подписчика** — один вызывающий может отменить свой запрос, не затрагивая остальных
-- **Таймаут** для каждого подписчика
-- **Короткий TTL-кеш** — позволяет повторно использовать свежий результат сразу после завершения
-- **`staleIfError`** — возвращает последний успешный результат, если текущая операция завершилась ошибкой
-- **Node.js 18+**
-
-## Дорожная карта
-
-Обозначения статуса: `[ ]` запланировано, `[x]` сделано. В колонке версии указан релиз, в котором пункт вышел; `TBD` означает, что конкретная версия пока не назначена.
-
-### Фаза 1: Наблюдаемость и контроль
-
-| Статус | Версия | Что будет                      | Зачем это нужно                                                          |
-| ------ | ------ | ------------------------------ | ------------------------------------------------------------------------ |
-| [x]    | 0.2.0  | Более понятная статистика      | Показывает, как часто работа реально разделяется и как используется кеш. |
-| [x]    | 0.2.0  | Понятный источник результата   | Показывает, пришёл ли результат из общего запроса или из кеша.           |
-| [x]    | 0.2.0  | Поддержка прогрева кеша        | Позволяет заранее подготовить горячие пути до прихода нагрузки.          |
-| [x]    | 0.2.0  | Безопасные лимиты stale-данных | Помогает держать устаревшие данные под контролем.                        |
-
-### Фаза 2: Более умная свежесть
-
-| Статус | Версия | Что будет                            | Зачем это нужно                                                                  |
-| ------ | ------ | ------------------------------------ | -------------------------------------------------------------------------------- |
-| [ ]    | 0.3.0  | Фоновое обновление stale-данных      | Позволяет быстро отвечать и тихо обновлять устаревшие данные в фоне.             |
-| [ ]    | 0.3.0  | Более безопасные helper'ы для ключей | Снижают риск ошибок между tenant-ами, токенами и другими auth-scoped сценариями. |
-| [ ]    | 0.3.0  | Больше практических примеров         | Показывают, как собирать ключи и настраивать freshness в реальных сервисах.      |
-| [ ]    | TBD    | Более безопасное завершение сервиса  | Делает остановку сервиса с активными запросами более предсказуемой.              |
-
-### Фаза 3: Production-зрелость
-
-| Статус | Версия | Что будет                                  | Зачем это нужно                                                                    |
-| ------ | ------ | ------------------------------------------ | ---------------------------------------------------------------------------------- |
-| [ ]    | 0.4.0  | Hooks для логов и метрик                   | Упрощают отправку shared, cache и stale сигналов во внешнюю observability-систему. |
-| [ ]    | 0.4.0  | Опциональные лимиты параллелизма на группу | Помогают беречь хрупкие внешние зависимости без превращения coflight в scheduler.  |
-| [ ]    | TBD    | Бенчмарки производительности               | Заранее задают реалистичные ожидания по скорости и компромиссам.                   |
-| [ ]    | TBD    | Гайды по миграции                          | Упрощают переход со старых inflight-пакетов.                                       |
-
-Retry и backoff пока намеренно не входят в roadmap ядра. Для реальных сервисов они полезны, но их политика слишком сильно зависит от транспорта, идемпотентности и классификации ошибок, чтобы жёстко вшивать её в маленькую библиотеку для coalescing.
-
 ## Установка
 
 ```bash
 npm install @kdinisv/coflight
 ```
 
+## Что делает библиотека
+
+Используйте coflight, когда несколько частей приложения могут одновременно запросить один и тот же ресурс:
+
+- первый вызов запускает реальную работу
+- следующие вызовы с тем же ключом ждут тот же promise
+- опциональный TTL позволяет короткое время переиспользовать свежий результат
+- опциональное stale-хранилище позволяет вернуть последнее успешное значение
+
+Типичные сценарии:
+
+- API и запросы к БД
+- SSR и server loaders
+- дорогие config- или service-discovery запросы
+- защита от наложения cron и worker-задач
+
 ## Быстрый старт
 
-```typescript
+```ts
 import { createCoflight } from "@kdinisv/coflight";
 
 interface User {
@@ -394,219 +336,251 @@ interface User {
 
 const users = createCoflight<string, User>();
 
-// Все параллельные вызовы с одним ключом разделяют один fetch
-async function getUser(id: string, signal?: AbortSignal): Promise<User> {
+export async function getUser(id: string, signal?: AbortSignal): Promise<User> {
   return users.run(
     `user:${id}`,
     ({ signal }) => fetch(`/api/users/${id}`, { signal }).then((r) => r.json()),
-    { signal, timeout: 3000, ttl: 5000 },
+    { signal, timeout: 3_000, ttl: 5_000 },
   );
 }
-
-users.warm("user:42", { id: "42", name: "Прогретый кеш" }, { ttl: 2_000 });
-
-const detailed = await users.runDetailed("user:42", ({ signal }) =>
-  fetch(`/api/users/42`, { signal }).then((r) => r.json()),
-);
-
-console.log(detailed.source); // "cache"
 ```
+
+## Источник результата
+
+`runDetailed()` и `refreshDetailed()` возвращают не только значение, но и источник:
+
+- `fresh` — этот вызов действительно запустил работу
+- `shared` — этот вызов присоединился к уже выполняющейся операции
+- `cache` — значение пришло из TTL-кеша
+- `stale` — значение пришло из stale-хранилища
 
 ## API
 
 ### `createCoflight<K, V>(options?)`
 
-Создаёт новую группу для дедупликации.
+Создаёт изолированную группу дедупликации.
 
-- `K` — тип ключа (extends `string`, по умолчанию `string`)
-- `V` — тип значения (по умолчанию `unknown`)
-- `options?.staleTtl` — максимальный возраст stale-результатов в мс. Если не указывать, stale-значения живут до замены или forget. Значение `0` отключает stale-хранилище.
-- `options?.maxStaleEntries` — верхняя граница для количества stale-результатов. Если не указывать, лимита нет. Значение `0` отключает stale-хранилище.
+- `staleTtl?: number` — сколько хранить stale-значения в мс. Если не указывать, они живут до замены или `forget`. Значение `0` отключает stale-хранилище.
+- `maxStaleEntries?: number` — максимум stale-записей. Если не указывать, лимита нет. Значение `0` отключает stale-хранилище.
 
-Возвращает `CoflightGroup<K, V>`.
-
----
+```ts
+const group = createCoflight<string, User>({
+  staleTtl: 60_000,
+  maxStaleEntries: 500,
+});
+```
 
 ### `group.run(key, fn, options?)`
 
-Выполняет `fn` для данного ключа или присоединяется к уже выполняющемуся вызову.
+Запускает `fn` для `key` или присоединяет вызов к уже идущей операции с тем же ключом.
 
-- **`key: K`** — ключ дедупликации.
-- **`fn: (ctx: { signal: AbortSignal }) => Promise<V> | V`** — функция, которая будет выполнена. Вызывается только для **первого** запроса; последующие подписчики получают тот же результат.
-- **`options?`** — см. ниже.
+```ts
+const value = await group.run(
+  "user:42",
+  ({ signal }) => loadUser("42", signal),
+  {
+    timeout: 2_000,
+    ttl: 5_000,
+  },
+);
+```
 
-Возвращает `Promise<V>`.
+Опции:
 
-#### Опции
-
-| Опция          | Тип           | Описание                                                                                        |
-| -------------- | ------------- | ----------------------------------------------------------------------------------------------- |
-| `signal`       | `AbortSignal` | Персональный сигнал отмены. **Не** отменяет общую операцию, пока **все** подписчики не отменят. |
-| `timeout`      | `number`      | Персональный таймаут в мс. Реджектится с `TimeoutError` при превышении.                         |
-| `ttl`          | `number`      | Кешировать результат на указанное количество мс после завершения. Задаётся первым вызывающим.   |
-| `staleIfError` | `boolean`     | Если `true` и операция провалилась, вернуть последний успешный результат для этого ключа.       |
-
----
+- `signal?: AbortSignal` — отмена только для конкретного вызова
+- `timeout?: number` — timeout для конкретного вызова в мс
+- `ttl?: number` — кешировать успешный результат на это число миллисекунд
+- `staleIfError?: boolean` — вернуть последнее успешное значение, если свежий вызов завершился ошибкой
+- `swr?: boolean` — сразу вернуть stale и обновить значение в фоне
 
 ### `group.runDetailed(key, fn, options?)`
 
-Работает как `group.run`, но дополнительно возвращает источник результата.
+То же поведение, что и у `run`, но возвращает `{ value, source }`.
 
-Возвращает `Promise<{ value: V; source: "fresh" | "shared" | "cache" | "stale" }>`.
+```ts
+const result = await group.runDetailed("user:42", ({ signal }) =>
+  loadUser("42", signal),
+);
 
-- `fresh` — этот подписчик запустил реальную работу.
-- `shared` — этот подписчик присоединился к уже идущему полёту.
-- `cache` — результат был взят из TTL-кеша.
-- `stale` — реальная операция завершилась ошибкой, и `staleIfError` вернул последнее успешное значение.
-
----
+console.log(result.source);
+```
 
 ### `group.warm(key, value, options?)`
 
-Заранее заполняет ключ значением до прихода реального трафика.
+Прогревает значение до прихода трафика.
 
-- `value: V` — значение для прогрева.
-- `options?.ttl` — окно TTL-кеша в мс.
-- `options?.stale` — нужно ли одновременно прогреть stale-хранилище. По умолчанию `true`.
+- `ttl?: number` — положить значение в TTL-кеш
+- `stale?: boolean` — также положить в stale-хранилище, по умолчанию `true`
 
-Возвращает `boolean` — `true`, если удалось записать кеш или stale-значение. Возвращает `false`, если ключ уже выполняется или сохранить было нечего.
+```ts
+group.warm("user:42", cachedUser, { ttl: 2_000 });
+```
 
----
+Возвращает `true`, если данные были записаны.
+
+### `group.refresh(key, fn, options?)`
+
+Игнорирует TTL-кеш и принудительно запускает свежее выполнение. Если операция уже идёт, вызов присоединяется к ней, а не создаёт дубликат.
+
+```ts
+await group.refresh("config:tenant-a", ({ signal }) =>
+  loadConfig("tenant-a", signal),
+);
+```
+
+### `group.refreshDetailed(key, fn, options?)`
+
+То же, что и `refresh`, но возвращает `{ value, source }`.
 
 ### `group.forget(key)`
 
-Удаляет `key` из карты полётов, TTL-кеша и хранилища stale-результатов. Уже подписанные вызывающие продолжают получать свой результат.
+Удаляет один ключ из отслеживаемого состояния.
 
-Возвращает `boolean` — `true`, если ключ был найден.
-
----
+```ts
+group.forget("user:42");
+```
 
 ### `group.clear()`
 
-Удаляет все записи: полёты, кеш и stale-результаты.
-
----
+Очищает все ключи, кеш и stale-значения.
 
 ### `group.isRunning(key)`
 
-Возвращает `boolean` — есть ли выполняющаяся операция для данного ключа.
-
----
+Возвращает `true`, если операция по ключу сейчас выполняется.
 
 ### `group.stats()`
 
-Возвращает живые размеры внутренних хранилищ и накопительные счётчики:
+Возвращает текущие счётчики и накопленную статистику:
 
 ```ts
 {
-  inflight: number;
-  cached: number;
-  stale: number;
-  requests: number;
-  freshRuns: number;
-  sharedRuns: number;
-  cacheHits: number;
-  staleHits: number;
-  warmups: number;
-  aborts: number;
-  timeouts: number;
+  inflight,
+  cached,
+  stale,
+  requests,
+  freshRuns,
+  sharedRuns,
+  cacheHits,
+  staleHits,
+  warmups,
+  aborts,
+  timeouts,
+  swrHits,
+  backgroundRefreshes,
+  backgroundRefreshFailures,
 }
 ```
 
-## Как это работает
+### `group.drain()`
 
+Перестаёт принимать новую работу и ждёт завершения всех текущих операций, включая фоновые SWR-обновления.
+
+Используйте для graceful shutdown, когда нужно дать текущей работе завершиться.
+
+### `group.shutdown()`
+
+Сразу прерывает все активные операции и очищает сохранённое состояние.
+
+Используйте, когда процесс нужно остановить немедленно.
+
+## Паттерны
+
+### TTL-кеш
+
+```ts
+await group.run("article:home", fetchHomepage, { ttl: 10_000 });
 ```
-Вызов A ─┐
-Вызов B ─┼─→ run("user:42", fn) ─→ ОДИН вызов fn() ─→ результат
-Вызов C ─┘                         │                      │
-                                    └── все вызывающие ←───┘
-                                        получают один результат
+
+Подходит, когда серия повторных чтений должна короткое время использовать свежий результат.
+
+### Stale при ошибке
+
+```ts
+await group.run("flags", loadFlags, { staleIfError: true });
 ```
 
-1. **Первый вызов** с ключом запускает реальную операцию.
-2. **Последующие вызовы** с тем же ключом присоединяются к текущей операции.
-3. Когда операция завершается, **все вызывающие получают результат**.
-4. С `ttl` результат кешируется на короткий период, поэтому новая операция не запускается.
-5. Каждый вызывающий может независимо отменить запрос через свой `AbortSignal`.
-6. Общая операция отменяется только тогда, когда **все** вызывающие отменили запрос.
+Подходит, когда лучше отдать последнее корректное значение, чем завалить запрос.
 
-## Поведение отмены
+### Stale While Revalidate
 
-Каждый подписчик может передать свой `AbortSignal`. Когда подписчик отменяет запрос:
+```ts
+await group.run("service:billing", lookupService, { swr: true });
+```
 
-- Promise этого подписчика реджектится с `AbortError`.
-- Другие подписчики **не затрагиваются**.
-- Нижележащая операция продолжается, пока остаётся хотя бы один активный подписчик.
-- Когда **все** подписчики отменили запрос, общий `AbortSignal`, переданный в `fn`, тоже отменяется.
+Подходит, когда важнее быстрый ответ, чем ожидание обновления на каждом запросе.
 
-Все внутренние listener'ы используют `{ once: true }`, чтобы не накапливать лишние обработчики.
+### Аккуратная остановка
 
-## Примеры использования
+```ts
+await group.drain();
+group.shutdown();
+```
 
-### Дедупликация запросов к API
+Используйте `drain()`, если текущая работа должна завершиться. Используйте `shutdown()`, если её нужно прервать.
 
-```typescript
-import { createCoflight } from "@kdinisv/coflight";
+## Helper'ы для ключей
 
-const api = createCoflight<string, any>();
+Доступны из `@kdinisv/coflight` и `@kdinisv/coflight/keys`.
 
-app.get("/users/:id", async (req, res) => {
-  const user = await api.run(
-    `user:${req.params.id}`,
-    ({ signal }) => db.users.findById(req.params.id, { signal }),
-    { timeout: 5000, ttl: 2000 },
-  );
-  res.json(user);
+### `composeKey(...segments)`
+
+Собирает ключ из одного или нескольких сегментов с автоматическим экранированием.
+
+```ts
+import { composeKey } from "@kdinisv/coflight";
+
+const key = composeKey("user", "tenant-a", "42");
+```
+
+### `createKeyFactory(prefix)`
+
+Создаёт переиспользуемый билдер ключей с фиксированным префиксом.
+
+```ts
+import { createKeyFactory } from "@kdinisv/coflight/keys";
+
+const userKey = createKeyFactory("user");
+
+userKey("42");
+userKey.scoped("tenant-a", "42");
+```
+
+### `createScopedKeyFactory(prefix, ...scopes)`
+
+Создаёт билдер ключей с фиксированной runtime-арностью.
+
+```ts
+import { createScopedKeyFactory } from "@kdinisv/coflight/keys";
+
+const configKey = createScopedKeyFactory("config", "tenantId", "env");
+
+configKey("acme", "prod");
+```
+
+### `createKeyNamespace(schema)`
+
+Создаёт типизированное пространство имён с builder'ами ключей.
+
+```ts
+import { createKeyNamespace } from "@kdinisv/coflight/keys";
+
+const keys = createKeyNamespace({
+  user: ["tenantId", "userId"],
+  session: ["sessionId"],
 });
+
+keys.user("acme", "42");
+keys.session("sess-abc");
 ```
 
-### SSR: дедупликация загрузки данных
+## Примеры
 
-```typescript
-const loaders = createCoflight<string, PageData>();
+Полные примеры есть в:
 
-async function renderPage(slug: string): Promise<string> {
-  const data = await loaders.run(`page:${slug}`, () => fetchPageData(slug), {
-    ttl: 10_000,
-    staleIfError: true,
-  });
-  return template(data);
-}
-```
-
-### Cron-задачи с защитой от наложения
-
-```typescript
-const jobs = createCoflight<string, void>();
-
-// Даже если cron сработал дважды, работа выполнится один раз
-cron.schedule("*/5 * * * *", () => {
-  jobs.run("sync-orders", () => syncOrders());
-});
-```
-
-### Отмена из WebSocket
-
-```typescript
-const flights = createCoflight<string, Report>();
-
-ws.on("message", async (msg) => {
-  const ac = new AbortController();
-  ws.once("cancel", () => ac.abort());
-
-  try {
-    const report = await flights.run(
-      `report:${msg.id}`,
-      ({ signal }) => generateReport(msg.id, { signal }),
-      { signal: ac.signal, timeout: 30_000 },
-    );
-    ws.send(JSON.stringify(report));
-  } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") return;
-    ws.send(JSON.stringify({ error: "failed" }));
-  }
-});
-```
+- [examples/auth-scoped-fetch.ts](examples/auth-scoped-fetch.ts)
+- [examples/multi-tenant-api.ts](examples/multi-tenant-api.ts)
+- [examples/swr-service-lookup.ts](examples/swr-service-lookup.ts)
+- [examples/graceful-shutdown.ts](examples/graceful-shutdown.ts)
 
 ## Лицензия
 
